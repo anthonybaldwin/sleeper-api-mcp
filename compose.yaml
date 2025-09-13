@@ -1,0 +1,17 @@
+services:
+  sleeper-api-mcp:
+    image: ghcr.io/anthonybaldwin/sleeper-api-mcp:latest
+    # For local build: comment line above, uncomment below
+    # build: .
+    container_name: sleeper-api-mcp
+    environment:
+      # User A
+      SLEEPER_USERNAME_A: your_sleeper_username
+      SLEEPER_LEAGUE_A_ID_1: your_league_id_1
+      # SLEEPER_LEAGUE_A_ID_2: second_league_id
+
+      # User B (optional)
+      # SLEEPER_USERNAME_B: second_username
+      # SLEEPER_LEAGUE_B_ID_1: second_user_league
+    stdin_open: true
+    tty: false
