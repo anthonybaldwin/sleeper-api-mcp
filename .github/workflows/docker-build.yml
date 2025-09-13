@@ -47,7 +47,8 @@ jobs:
       uses: docker/build-push-action@v6
       with:
         context: .
-        push: true
+        push: ${{ github.event_name != 'pull_request' }}
+        load: ${{ github.event_name == 'pull_request' }}
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
         cache-from: type=gha
@@ -55,9 +56,16 @@ jobs:
 
     - name: Test Docker image
       run: |
-        # Pull the image we just pushed
-        docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7}
+        IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7}"
+
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          echo "Testing locally built image for PR..."
+        else
+          echo "Testing pushed image for main branch..."
+          docker pull $IMAGE_TAG
+        fi
+
         # Test that the container and node are working
-        docker run --rm --entrypoint node ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7} --version
+        docker run --rm --entrypoint node $IMAGE_TAG --version
         # Test that our built files exist
-        docker run --rm --entrypoint ls ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7} -la dist/index.js
+        docker run --rm --entrypoint ls $IMAGE_TAG -la dist/index.js
