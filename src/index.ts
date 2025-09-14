@@ -17,6 +17,42 @@ const SLEEPER_PROJECTIONS_BASE = "https://api.sleeper.com/projections/nfl";
 const SLEEPER_AVATAR_BASE = "https://sleepercdn.com/avatars";
 const SLEEPER_AVATAR_THUMB_BASE = "https://sleepercdn.com/avatars/thumbs";
 
+// MCP has a 1MB limit on response size
+const MAX_RESPONSE_SIZE = 1048576;
+
+function safeStringify(data: any, replacer?: any, indent: number | string = 2): string {
+  let result = JSON.stringify(data, replacer, indent);
+
+  // Check if response is too large
+  if (result.length > MAX_RESPONSE_SIZE) {
+    // Try without indentation
+    result = JSON.stringify(data, replacer);
+
+    if (result.length > MAX_RESPONSE_SIZE) {
+      // If still too large, truncate or summarize
+      if (Array.isArray(data)) {
+        // For arrays, limit the number of items
+        const itemsToShow = Math.floor(data.length * (MAX_RESPONSE_SIZE / result.length));
+        result = JSON.stringify({
+          message: `Response too large. Showing ${itemsToShow} of ${data.length} items`,
+          data: data.slice(0, itemsToShow),
+          total_items: data.length
+        }, replacer, indent);
+      } else if (typeof data === 'object' && data !== null) {
+        // For objects, try to summarize
+        const keys = Object.keys(data);
+        result = JSON.stringify({
+          message: `Response too large. Object has ${keys.length} keys`,
+          keys: keys.slice(0, 100),
+          sample: JSON.parse(JSON.stringify(data, replacer, 0).substring(0, 50000))
+        }, replacer, indent);
+      }
+    }
+  }
+
+  return result;
+}
+
 interface SleeperUser {
   username: string;
   user_id: string;
@@ -1209,7 +1245,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -1227,7 +1263,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -1241,7 +1277,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -1255,7 +1291,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -1269,7 +1305,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -1283,7 +1319,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -1297,7 +1333,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -1322,7 +1358,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -1355,7 +1391,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(players, null, 2),
+          text: safeStringify(players, null, 2),
         },
       ],
     };
@@ -1369,7 +1405,7 @@ class SleeperMCPServer {
         content: [
           {
             type: "text",
-            text: JSON.stringify({
+            text: safeStringify({
               error: "No league configuration found",
               message: "Please configure at least one user and league in your .env file",
               hint: "Set SLEEPER_USERNAME_A and SLEEPER_LEAGUE_A_ID_1 in .env"
@@ -1385,7 +1421,7 @@ class SleeperMCPServer {
         content: [
           {
             type: "text",
-            text: JSON.stringify({
+            text: safeStringify({
               error: "Could not find roster for user in this league",
               user: user.username,
               league: league.leagueId
@@ -1422,7 +1458,7 @@ class SleeperMCPServer {
         content: [
           {
             type: "text",
-            text: JSON.stringify({
+            text: safeStringify({
               week: actualWeek,
               type: "historical",
               my_score: myMatchup?.points || 0,
@@ -1456,7 +1492,7 @@ class SleeperMCPServer {
         content: [
           {
             type: "text",
-            text: JSON.stringify({
+            text: safeStringify({
               error: "No league configuration found",
               message: "Please configure at least one user and league in your .env file",
               hint: "Set SLEEPER_USERNAME_A and SLEEPER_LEAGUE_A_ID_1 in .env"
@@ -1472,7 +1508,7 @@ class SleeperMCPServer {
         content: [
           {
             type: "text",
-            text: JSON.stringify({
+            text: safeStringify({
               error: "Could not find roster for user in this league",
               user: user.username,
               league: league.leagueId
@@ -1519,7 +1555,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify({
+          text: safeStringify({
             season_record: `${wins}-${losses}${ties > 0 ? `-${ties}` : ""}`,
             total_points_for: history.reduce((sum, h) => sum + h.my_score, 0),
             total_points_against: history.reduce((sum, h) => sum + h.opponent_score, 0),
@@ -1540,7 +1576,7 @@ class SleeperMCPServer {
         content: [
           {
             type: "text",
-            text: JSON.stringify({
+            text: safeStringify({
               error: "No league configuration found",
               message: "Please configure at least one user and league in your .env file",
               hint: "Set SLEEPER_USERNAME_A and SLEEPER_LEAGUE_A_ID_1 in .env"
@@ -1556,7 +1592,7 @@ class SleeperMCPServer {
         content: [
           {
             type: "text",
-            text: JSON.stringify({
+            text: safeStringify({
               error: "Could not find roster for user in this league",
               user: user.username,
               league: league.leagueId
@@ -1595,7 +1631,7 @@ class SleeperMCPServer {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ message: "No opponent this week (bye week or playoffs)" }, null, 2),
+            text: safeStringify({ message: "No opponent this week (bye week or playoffs)" }, null, 2),
           },
         ],
       };
@@ -1608,7 +1644,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify({
+          text: safeStringify({
             week: actualWeek,
             opponent: {
               username: oppUser?.username,
@@ -1667,7 +1703,7 @@ class SleeperMCPServer {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ error: "No avatar found for user" }, null, 2),
+            text: safeStringify({ error: "No avatar found for user" }, null, 2),
           },
         ],
       };
@@ -1678,7 +1714,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify({
+          text: safeStringify({
             avatar_id: avatarId,
             avatar_url: `${baseUrl}/${avatarId}`,
             thumbnail: thumbnail,
@@ -1752,7 +1788,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(info, null, 2),
+          text: safeStringify(info, null, 2),
         },
       ],
     };
@@ -1871,7 +1907,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(analysis, null, 2),
+          text: safeStringify(analysis, null, 2),
         },
       ],
     };
@@ -2064,7 +2100,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(result, null, 2),
+          text: safeStringify(result, null, 2),
         },
       ],
     };
@@ -2316,7 +2352,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(preview, null, 2),
+          text: safeStringify(preview, null, 2),
         },
       ],
     };
@@ -2353,7 +2389,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
+          text: safeStringify(
             {
               total: freeAgents.length,
               position_filter: position || "all",
@@ -2447,7 +2483,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
+          text: safeStringify(
             {
               week,
               roster_id: rosterId,
@@ -2476,7 +2512,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(projections.data, null, 2),
+          text: safeStringify(projections.data, null, 2),
         },
       ],
     };
@@ -2491,7 +2527,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -2505,7 +2541,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -2519,7 +2555,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -2533,7 +2569,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -2547,7 +2583,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -2562,7 +2598,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -2576,7 +2612,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -2591,7 +2627,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -2626,7 +2662,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
@@ -2695,7 +2731,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
+          text: safeStringify(
             {
               week,
               current_nfl_week: nflState.data.week,
@@ -2770,7 +2806,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
+          text: safeStringify(
             {
               your_roster_id: rosterId,
               position_needs: needs,
@@ -2799,7 +2835,7 @@ class SleeperMCPServer {
         content: [
           {
             type: "text",
-            text: JSON.stringify(weekStats || { message: "No stats for this week" }, null, 2),
+            text: safeStringify(weekStats || { message: "No stats for this week" }, null, 2),
           },
         ],
       };
@@ -2809,7 +2845,7 @@ class SleeperMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify(response.data, null, 2),
+          text: safeStringify(response.data, null, 2),
         },
       ],
     };
