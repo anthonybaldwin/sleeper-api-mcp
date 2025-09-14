@@ -1376,6 +1376,35 @@ class SleeperMCPServer {
         rosterToTeam.get(id) || `Roster ${id}`
       );
 
+      // Generate news queries for significant transactions
+      const newsQueries: any[] = [];
+      if (transaction.adds) {
+        Object.keys(transaction.adds).forEach((playerId) => {
+          const player = this.playersCache.get(playerId);
+          if (player) {
+            const playerName = `${player.first_name} ${player.last_name}`;
+            newsQueries.push({
+              player: playerName,
+              action: "added",
+              query: `${playerName} NFL fantasy waiver wire pickup ${new Date().getFullYear()}`
+            });
+          }
+        });
+      }
+      if (transaction.drops) {
+        Object.keys(transaction.drops).forEach((playerId) => {
+          const player = this.playersCache.get(playerId);
+          if (player) {
+            const playerName = `${player.first_name} ${player.last_name}`;
+            newsQueries.push({
+              player: playerName,
+              action: "dropped",
+              query: `${playerName} NFL injury news fantasy drop ${new Date().getFullYear()}`
+            });
+          }
+        });
+      }
+
       return {
         type: transaction.type,
         status: transaction.status,
@@ -1384,8 +1413,15 @@ class SleeperMCPServer {
         drops: Object.keys(drops).length > 0 ? drops : undefined,
         waiver_budget: transaction.waiver_budget,
         created: new Date(transaction.created).toLocaleString(),
+        news_queries: newsQueries.length > 0 ? newsQueries : undefined
       };
     });
+
+    // Identify high-impact transactions
+    const significantTransactions = formattedTransactions.filter(t =>
+      (t.adds && Object.keys(t.adds).length > 2) ||
+      (t.waiver_budget && t.waiver_budget[0] > 10)
+    );
 
     return {
       content: [
@@ -1394,7 +1430,11 @@ class SleeperMCPServer {
           text: safeStringify({
             week,
             total_transactions: formattedTransactions.length,
-            transactions: formattedTransactions
+            transactions: formattedTransactions,
+            requires_news_context: significantTransactions.length > 0,
+            news_instruction: significantTransactions.length > 0
+              ? "Use Perplexity to search the news_queries for recent player transactions to understand roster moves"
+              : undefined
           }, null, 2),
         },
       ],
@@ -2212,21 +2252,38 @@ class SleeperMCPServer {
 
     const recommendations = topCandidates
       .slice(0, limit || 10)
-      .map((player) => ({
-        player: `${player.first_name} ${player.last_name}`,
-        position: player.position,
-        team: player.team,
-        trending_adds: player.trending_add,
-        current_week_projection: player.avg_projection,
-        fills_need: rosterNeeds.includes(player.position),
-        injury_status: player.injury_status || "Healthy",
-        recommendation_score: player.overall_score,
-      }));
+      .map((player) => {
+        const playerName = `${player.first_name} ${player.last_name}`;
+        const trendingAdds = player.trending_add || 0;
+
+        return {
+          player: playerName,
+          position: player.position,
+          team: player.team,
+          trending_adds: trendingAdds,
+          current_week_projection: player.avg_projection,
+          fills_need: rosterNeeds.includes(player.position),
+          injury_status: player.injury_status || "Healthy",
+          recommendation_score: player.overall_score,
+          // Add news context for highly trending players
+          news_queries: trendingAdds > 100 ? {
+            primary: `${playerName} NFL ${new Date().getFullYear()} injury trade waiver wire news`,
+            alternate: [
+              `${playerName} fantasy football outlook week ${this.currentWeek}`,
+              `${playerName} ${player.team || 'NFL'} depth chart injury report`,
+              `Why is ${playerName} trending fantasy football waiver wire adds`
+            ],
+            context: `Player has ${trendingAdds} adds this week - check for breaking news, injuries, or trades`
+          } : undefined
+        };
+      });
 
     const waiverBudget = roster.settings.waiver_budget_total
       ? roster.settings.waiver_budget_total -
         (roster.settings.waiver_budget_used || 0)
       : null;
+
+    const highTrendingPlayers = recommendations.filter(p => p.trending_adds > 100);
 
     const result = {
       roster_needs: rosterNeeds,
@@ -2235,6 +2292,10 @@ class SleeperMCPServer {
       waiver_budget_remaining: waiverBudget,
       total_moves_made: roster.settings.total_moves,
       analysis_note: "Recommendations based on: upcoming schedule projections, trending adds, and roster needs",
+      requires_news_context: highTrendingPlayers.length > 0,
+      news_instruction: highTrendingPlayers.length > 0
+        ? `Use Perplexity to search news for: ${highTrendingPlayers.map(p => p.player).join(', ')}. Check their news_queries to understand why they're trending.`
+        : undefined
     };
 
     return {
@@ -2502,29 +2563,61 @@ class SleeperMCPServer {
   private async getFreeAgents(leagueId: string, position?: string) {
     await this.loadPlayersCache();
 
-    const rosters = await axios.get<SleeperRoster[]>(
-      `${SLEEPER_API_BASE}/league/${leagueId}/rosters`,
-    );
+    const [rostersResp, trendingResp] = await Promise.all([
+      axios.get<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
+      axios.get(`${SLEEPER_API_BASE}/players/nfl/trending/add`).catch(() => null)
+    ]);
+
     const allRosteredPlayers = new Set(
-      rosters.data.flatMap((r) => r.players || []),
+      rostersResp.data.flatMap((r) => r.players || []),
     );
+
+    // Get trending data
+    const trendingAdds = new Map<string, number>();
+    if (trendingResp?.data) {
+      for (const trend of trendingResp.data) {
+        trendingAdds.set(trend.player_id, trend.count || 0);
+      }
+    }
 
     const freeAgents = [];
     for (const [playerId, player] of this.playersCache) {
       if (!allRosteredPlayers.has(playerId) && player.status === "Active") {
         if (!position || player.position === position) {
+          const playerName = `${player.first_name} ${player.last_name}`;
+          const trendingCount = trendingAdds.get(playerId) || 0;
+
           freeAgents.push({
             player_id: playerId,
-            name: `${player.first_name} ${player.last_name}`,
+            name: playerName,
             position: player.position,
             team: player.team,
             injury_status: player.injury_status,
+            trending_adds: trendingCount,
+            // Add news queries for highly trending players
+            news_queries: trendingCount > 100 ? {
+              primary: `${playerName} NFL ${new Date().getFullYear()} injury trade news`,
+              alternate: [
+                `${playerName} fantasy football waiver wire trending`,
+                `Why is ${playerName} being added fantasy football`
+              ],
+              context: `Player has ${trendingCount} adds - check for recent news`
+            } : undefined
           });
         }
       }
     }
 
-    freeAgents.sort((a, b) => a.name.localeCompare(b.name));
+    // Sort by trending adds first, then by name
+    freeAgents.sort((a, b) => {
+      if (b.trending_adds !== a.trending_adds) {
+        return b.trending_adds - a.trending_adds;
+      }
+      return a.name.localeCompare(b.name);
+    });
+
+    const topFreeAgents = freeAgents.slice(0, 100);
+    const highTrendingPlayers = topFreeAgents.filter(p => p.trending_adds > 100);
 
     return {
       content: [
@@ -2534,7 +2627,11 @@ class SleeperMCPServer {
             {
               total: freeAgents.length,
               position_filter: position || "all",
-              free_agents: freeAgents.slice(0, 100),
+              free_agents: topFreeAgents,
+              requires_news_context: highTrendingPlayers.length > 0,
+              news_instruction: highTrendingPlayers.length > 0
+                ? `Use Perplexity to search news for trending players: ${highTrendingPlayers.slice(0, 5).map(p => p.name).join(', ')}`
+                : undefined
             },
             null,
             2,
