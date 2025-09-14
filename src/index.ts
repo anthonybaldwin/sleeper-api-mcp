@@ -288,6 +288,11 @@ class SleeperMCPServer {
   }
 
   private async findUserAndLeague(hint?: string): Promise<{user: UserConfig, league: any, rosterId?: string} | null> {
+    // Ensure we have at least basic configuration
+    if (this.users.length === 0 || this.users[0].leagues.length === 0) {
+      return null;
+    }
+
     // If only one user and one league, use that as default
     if (!hint && this.users.length === 1 && this.users[0].leagues.length === 1) {
       const user = this.users[0];
@@ -314,6 +319,7 @@ class SleeperMCPServer {
             if (!league.leagueName) {
               // Fetch league name if not cached
               try {
+                await this.rateLimit();
                 const leagueInfo = await axios.get<SleeperLeague>(`${SLEEPER_API_BASE}/league/${league.leagueId}`);
                 league.leagueName = leagueInfo.data.name;
               } catch (e) {
@@ -351,14 +357,10 @@ class SleeperMCPServer {
     }
 
     // Default to first user/league if no match
-    if (this.users.length > 0 && this.users[0].leagues.length > 0) {
-      const user = this.users[0];
-      const league = user.leagues[0];
-      await this.ensureRosterId(user, league);
-      return { user, league, rosterId: league.rosterId };
-    }
-
-    return null;
+    const user = this.users[0];
+    const league = user.leagues[0];
+    await this.ensureRosterId(user, league);
+    return { user, league, rosterId: league.rosterId };
   }
 
   private async ensureRosterId(user: UserConfig, league: any): Promise<void> {
@@ -372,12 +374,43 @@ class SleeperMCPServer {
 
         await this.rateLimit();
         const rosters = await axios.get<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/rosters`);
-        const roster = rosters.data.find(r => r.owner_id === user.userId);
+
+        // First try to find by owner_id
+        let roster = rosters.data.find(r => r.owner_id === user.userId);
+
+        // If not found, try to match by fetching league users
+        if (!roster && rosters.data.length > 0) {
+          await this.rateLimit();
+          const leagueUsers = await axios.get<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/users`);
+          const leagueUser = leagueUsers.data.find(u => u.username === user.username || u.user_id === user.userId);
+          if (leagueUser) {
+            roster = rosters.data.find(r => r.owner_id === leagueUser.user_id);
+            if (roster) {
+              user.userId = leagueUser.user_id; // Update with correct user ID
+            }
+          }
+        }
+
         if (roster) {
           league.rosterId = roster.roster_id.toString();
         }
       } catch (e) {
         console.error('Error finding roster:', e);
+        // Don't throw - let the calling function handle missing roster
+      }
+    }
+  }
+
+  private async ensureUserIds(): Promise<void> {
+    for (const user of this.users) {
+      if (!user.userId) {
+        try {
+          await this.rateLimit();
+          const userInfo = await axios.get<SleeperUser>(`${SLEEPER_API_BASE}/user/${user.username}`);
+          user.userId = userInfo.data.user_id;
+        } catch (e) {
+          console.error(`Error fetching user ID for ${user.username}:`, e);
+        }
       }
     }
   }
