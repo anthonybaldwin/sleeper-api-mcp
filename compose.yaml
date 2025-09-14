@@ -1,3 +1,5 @@
+name: sleeper-api-mcp
+
 services:
   sleeper-api-mcp:
     image: ghcr.io/anthonybaldwin/sleeper-api-mcp:latest

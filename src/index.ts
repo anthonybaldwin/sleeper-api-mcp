@@ -382,7 +382,13 @@ class SleeperMCPServer {
         if (!roster && rosters.data.length > 0) {
           await this.rateLimit();
           const leagueUsers = await axios.get<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/users`);
-          const leagueUser = leagueUsers.data.find(u => u.username === user.username || u.user_id === user.userId);
+
+          // League users have display_name, not username
+          const leagueUser = leagueUsers.data.find(u =>
+            u.display_name === user.username ||
+            u.user_id === user.userId
+          );
+
           if (leagueUser) {
             roster = rosters.data.find(r => r.owner_id === leagueUser.user_id);
             if (roster) {
