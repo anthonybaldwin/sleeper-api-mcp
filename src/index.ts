@@ -1326,14 +1326,76 @@ class SleeperMCPServer {
   }
 
   private async getTransactions(leagueId: string, week: number) {
-    const response = await axios.get<SleeperTransaction[]>(
-      `${SLEEPER_API_BASE}/league/${leagueId}/transactions/${week}`,
-    );
+    await this.loadPlayersCache();
+
+    const [transactionsResponse, rostersResponse, usersResponse] = await Promise.all([
+      axios.get<SleeperTransaction[]>(
+        `${SLEEPER_API_BASE}/league/${leagueId}/transactions/${week}`,
+      ),
+      axios.get<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
+      axios.get<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
+    ]);
+
+    // Create roster ID to team name mapping
+    const rosterToTeam = new Map<number, string>();
+    rostersResponse.data.forEach(roster => {
+      const user = usersResponse.data.find(u => u.user_id === roster.owner_id);
+      if (user) {
+        rosterToTeam.set(roster.roster_id, user.display_name || user.username || `Team ${roster.roster_id}`);
+      }
+    });
+
+    // Format transactions with player and team names
+    const formattedTransactions = transactionsResponse.data.map(transaction => {
+      const adds: Record<string, string> = {};
+      const drops: Record<string, string> = {};
+
+      if (transaction.adds) {
+        Object.entries(transaction.adds).forEach(([playerId, rosterId]) => {
+          const player = this.playersCache.get(playerId);
+          const teamName = rosterToTeam.get(rosterId) || `Roster ${rosterId}`;
+          const playerName = player
+            ? `${player.first_name} ${player.last_name} (${player.position} - ${player.team || 'FA'})`
+            : `Player ${playerId}`;
+          adds[playerName] = teamName;
+        });
+      }
+
+      if (transaction.drops) {
+        Object.entries(transaction.drops).forEach(([playerId, rosterId]) => {
+          const player = this.playersCache.get(playerId);
+          const teamName = rosterToTeam.get(rosterId) || `Roster ${rosterId}`;
+          const playerName = player
+            ? `${player.first_name} ${player.last_name} (${player.position} - ${player.team || 'FA'})`
+            : `Player ${playerId}`;
+          drops[playerName] = teamName;
+        });
+      }
+
+      const involvedTeams = transaction.roster_ids.map(id =>
+        rosterToTeam.get(id) || `Roster ${id}`
+      );
+
+      return {
+        type: transaction.type,
+        status: transaction.status,
+        teams_involved: involvedTeams,
+        adds: Object.keys(adds).length > 0 ? adds : undefined,
+        drops: Object.keys(drops).length > 0 ? drops : undefined,
+        waiver_budget: transaction.waiver_budget,
+        created: new Date(transaction.created).toLocaleString(),
+      };
+    });
+
     return {
       content: [
         {
           type: "text",
-          text: safeStringify(response.data, null, 2),
+          text: safeStringify({
+            week,
+            total_transactions: formattedTransactions.length,
+            transactions: formattedTransactions
+          }, null, 2),
         },
       ],
     };
@@ -1345,6 +1407,8 @@ class SleeperMCPServer {
     lookbackHours: number | undefined = 24,
     limit: number | undefined = 25,
   ) {
+    await this.loadPlayersCache();
+
     const response = await axios.get(
       `${SLEEPER_API_BASE}/players/${sport}/trending/${type}`,
       {
@@ -1354,11 +1418,32 @@ class SleeperMCPServer {
         },
       },
     );
+
+    // Format trending players with names
+    const formattedTrending = response.data.map((item: any) => {
+      const player = this.playersCache.get(item.player_id);
+      return {
+        player: player
+          ? `${player.first_name} ${player.last_name} (${player.position} - ${player.team || 'FA'})`
+          : `Player ${item.player_id}`,
+        count: item.count,
+        player_id: item.player_id,
+        injury_status: player?.injury_status,
+        years_exp: player?.years_exp,
+        age: player?.age,
+      };
+    });
+
     return {
       content: [
         {
           type: "text",
-          text: safeStringify(response.data, null, 2),
+          text: safeStringify({
+            type: type === 'add' ? 'Most Added' : 'Most Dropped',
+            lookback_hours: lookbackHours,
+            total: formattedTrending.length,
+            players: formattedTrending
+          }, null, 2),
         },
       ],
     };
@@ -1398,6 +1483,8 @@ class SleeperMCPServer {
   }
 
   private async getMyMatchup(week?: number, leagueHint?: string) {
+    await this.loadPlayersCache();
+
     // Find the appropriate user and league
     const config = await this.findUserAndLeague(leagueHint);
     if (!config) {
@@ -1443,6 +1530,23 @@ class SleeperMCPServer {
       isHistorical = true;
     }
 
+    // Get users for team names
+    const usersResponse = await axios.get<SleeperUser[]>(
+      `${SLEEPER_API_BASE}/league/${league.leagueId}/users`
+    );
+    const rostersResponse = await axios.get<SleeperRoster[]>(
+      `${SLEEPER_API_BASE}/league/${league.leagueId}/rosters`
+    );
+
+    // Create roster ID to team name mapping
+    const rosterToTeam = new Map<number, string>();
+    rostersResponse.data.forEach(roster => {
+      const user = usersResponse.data.find(u => u.user_id === roster.owner_id);
+      if (user) {
+        rosterToTeam.set(roster.roster_id, user.display_name || user.username || `Team ${roster.roster_id}`);
+      }
+    });
+
     // For past weeks, get actual scores instead of projections
     if (isHistorical) {
       const matchups = await axios.get<SleeperMatchup[]>(
@@ -1454,6 +1558,20 @@ class SleeperMCPServer {
         (m) => m.matchup_id === myMatchup?.matchup_id && m.roster_id !== parseInt(rosterId),
       );
 
+      // Format player names for starters
+      const formatPlayers = (playerIds?: string[], points?: number[]) => {
+        if (!playerIds) return [];
+        return playerIds.map((id, idx) => {
+          const player = this.playersCache.get(id);
+          const playerName = player
+            ? `${player.first_name} ${player.last_name} (${player.position} - ${player.team || 'FA'})`
+            : `Player ${id}`;
+          return points ? `${playerName}: ${points[idx]?.toFixed(2) || '0.00'} pts` : playerName;
+        });
+      };
+
+      const opponentName = oppMatchup ? rosterToTeam.get(oppMatchup.roster_id) || `Roster ${oppMatchup.roster_id}` : 'BYE';
+
       return {
         content: [
           {
@@ -1461,15 +1579,15 @@ class SleeperMCPServer {
             text: safeStringify({
               week: actualWeek,
               type: "historical",
+              my_team: user.username,
+              opponent: opponentName,
               my_score: myMatchup?.points || 0,
               opponent_score: oppMatchup?.points || 0,
               result: myMatchup && oppMatchup ?
                 (myMatchup.points > oppMatchup.points ? "WON" :
                  myMatchup.points < oppMatchup.points ? "LOST" : "TIED") : "N/A",
-              my_starters: myMatchup?.starters,
-              my_starters_points: myMatchup?.starters_points,
-              opponent_starters: oppMatchup?.starters,
-              opponent_starters_points: oppMatchup?.starters_points,
+              my_starters: formatPlayers(myMatchup?.starters, myMatchup?.starters_points),
+              opponent_starters: formatPlayers(oppMatchup?.starters, oppMatchup?.starters_points),
             }, null, 2),
           },
         ],
@@ -1519,8 +1637,21 @@ class SleeperMCPServer {
     }
 
     await this.rateLimit();
-    const nflState = await axios.get<NFLState>(`${SLEEPER_API_BASE}/state/nfl`);
+    const [nflState, usersResponse, rostersResponse] = await Promise.all([
+      axios.get<NFLState>(`${SLEEPER_API_BASE}/state/nfl`),
+      axios.get<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/users`),
+      axios.get<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/rosters`),
+    ]);
     const currentWeek = nflState.data.week;
+
+    // Create roster ID to team name mapping
+    const rosterToTeam = new Map<number, string>();
+    rostersResponse.data.forEach(roster => {
+      const user = usersResponse.data.find(u => u.user_id === roster.owner_id);
+      if (user) {
+        rosterToTeam.set(roster.roster_id, user.display_name || user.username || `Team ${roster.roster_id}`);
+      }
+    });
 
     const history = [];
     for (let week = 1; week < currentWeek; week++) {
@@ -1535,11 +1666,12 @@ class SleeperMCPServer {
       );
 
       if (myMatchup && oppMatchup) {
+        const opponentName = rosterToTeam.get(oppMatchup.roster_id) || `Roster ${oppMatchup.roster_id}`;
         history.push({
           week,
+          opponent: opponentName,
           my_score: myMatchup.points,
           opponent_score: oppMatchup.points,
-          opponent_roster_id: oppMatchup.roster_id,
           result: myMatchup.points > oppMatchup.points ? "W" :
                   myMatchup.points < oppMatchup.points ? "L" : "T",
           margin: Math.abs(myMatchup.points - oppMatchup.points),
@@ -1803,11 +1935,12 @@ class SleeperMCPServer {
   ) {
     await this.loadPlayersCache();
 
-    const [league, rosters] = await Promise.all([
+    const [league, rosters, users] = await Promise.all([
       axios.get<SleeperLeague>(`${SLEEPER_API_BASE}/league/${leagueId}`),
       axios.get<SleeperRoster[]>(
         `${SLEEPER_API_BASE}/league/${leagueId}/rosters`,
       ),
+      axios.get<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
     ]);
 
     const roster1 = rosters.data.find((r) => r.roster_id === rosterId1);
@@ -1816,6 +1949,12 @@ class SleeperMCPServer {
     if (!roster1 || !roster2) {
       throw new Error("Invalid roster IDs");
     }
+
+    // Get team names
+    const user1 = users.data.find(u => u.user_id === roster1.owner_id);
+    const user2 = users.data.find(u => u.user_id === roster2.owner_id);
+    const team1Name = user1?.display_name || user1?.username || `Team ${rosterId1}`;
+    const team2Name = user2?.display_name || user2?.username || `Team ${rosterId2}`;
 
     const getPlayerValue = (playerId: string): number => {
       const player = this.playersCache.get(playerId);
@@ -1867,31 +2006,33 @@ class SleeperMCPServer {
     );
 
     if (positionalNeeds1.length > 0)
-      riskFactors.push(`Team 1 needs: ${positionalNeeds1.join(", ")}`);
+      riskFactors.push(`${team1Name} needs: ${positionalNeeds1.join(", ")}`);
     if (positionalNeeds2.length > 0)
-      riskFactors.push(`Team 2 needs: ${positionalNeeds2.join(", ")}`);
+      riskFactors.push(`${team2Name} needs: ${positionalNeeds2.join(", ")}`);
 
     let recommendation = "Fair trade";
     if (percentDiff > 30) {
       recommendation =
         team1Value > team2Value
-          ? "Team 1 wins significantly"
-          : "Team 2 wins significantly";
+          ? `${team1Name} wins significantly`
+          : `${team2Name} wins significantly`;
     } else if (percentDiff > 15) {
       recommendation =
         team1Value > team2Value
-          ? "Team 1 has slight advantage"
-          : "Team 2 has slight advantage";
+          ? `${team1Name} has slight advantage`
+          : `${team2Name} has slight advantage`;
     }
 
     const analysis = {
+      team1: team1Name,
       team1_gives: playersFrom1.map((id) => {
         const p = this.playersCache.get(id);
-        return p ? `${p.first_name} ${p.last_name} (${p.position})` : id;
+        return p ? `${p.first_name} ${p.last_name} (${p.position} - ${p.team || 'FA'})` : id;
       }),
+      team2: team2Name,
       team2_gives: playersFrom2.map((id) => {
         const p = this.playersCache.get(id);
-        return p ? `${p.first_name} ${p.last_name} (${p.position})` : id;
+        return p ? `${p.first_name} ${p.last_name} (${p.position} - ${p.team || 'FA'})` : id;
       }),
       team1_value: team1Value,
       team2_value: team2Value,
@@ -2748,17 +2889,22 @@ class SleeperMCPServer {
   private async analyzeTradeTargets(leagueId: string, rosterId: number) {
     await this.loadPlayersCache();
 
-    const [rosters, matchups] = await Promise.all([
+    const [rosters, matchups, users] = await Promise.all([
       axios.get<SleeperRoster[]>(
         `${SLEEPER_API_BASE}/league/${leagueId}/rosters`,
       ),
       axios.get<SleeperMatchup[]>(
         `${SLEEPER_API_BASE}/league/${leagueId}/matchups/1`,
       ),
+      axios.get<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
     ]);
 
     const myRoster = rosters.data.find((r) => r.roster_id === rosterId);
     if (!myRoster) throw new Error("Roster not found");
+
+    // Get my team name
+    const myUser = users.data.find(u => u.user_id === myRoster.owner_id);
+    const myTeamName = myUser?.display_name || myUser?.username || `Roster ${rosterId}`;
 
     // Analyze position needs
     const positionCounts: Record<string, number> = {};
@@ -2780,6 +2926,10 @@ class SleeperMCPServer {
     rosters.data.forEach((roster) => {
       if (roster.roster_id === rosterId) return;
 
+      // Get team name
+      const user = users.data.find(u => u.user_id === roster.owner_id);
+      const teamName = user?.display_name || user?.username || `Roster ${roster.roster_id}`;
+
       const rosterPositions: Record<string, string[]> = {};
       roster.players.forEach((playerId) => {
         const player = this.playersCache.get(playerId);
@@ -2788,14 +2938,14 @@ class SleeperMCPServer {
             rosterPositions[player.position] = [];
           }
           rosterPositions[player.position].push(
-            `${player.first_name} ${player.last_name}`,
+            `${player.first_name} ${player.last_name} (${player.team || 'FA'})`,
           );
         }
       });
 
       if (Object.keys(rosterPositions).length > 0) {
         targets.push({
-          roster_id: roster.roster_id,
+          team: teamName,
           record: `${roster.settings.wins}-${roster.settings.losses}`,
           potential_targets: rosterPositions,
         });
@@ -2808,7 +2958,7 @@ class SleeperMCPServer {
           type: "text",
           text: safeStringify(
             {
-              your_roster_id: rosterId,
+              your_team: myTeamName,
               position_needs: needs,
               current_roster: positionCounts,
               trade_targets: targets,
