@@ -1,0 +1,187 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+            target: bun-linux-x64
+          - os: ubuntu-latest
+            platform: linux-arm64
+            target: bun-linux-aarch64
+          - os: macos-latest
+            platform: macos-x64
+            target: bun-darwin-x64
+          - os: macos-latest
+            platform: macos-arm64
+            target: bun-darwin-aarch64
+          - os: windows-latest
+            platform: windows-x64
+            target: bun-windows-x64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build executable
+        run: bun build src/index.ts --compile --target=${{ matrix.target }} --outfile sleeper-mcp
+
+      - name: Rename artifact with platform
+        shell: bash
+        run: |
+          if [[ "${{ matrix.platform }}" == windows* ]]; then
+            # Rename to sleeper-mcp-windows-x64.exe
+            mv sleeper-mcp.exe sleeper-mcp-${{ matrix.platform }}.exe
+          else
+            # Rename to sleeper-mcp-{platform}
+            mv sleeper-mcp sleeper-mcp-${{ matrix.platform }}
+            chmod +x sleeper-mcp-${{ matrix.platform }}
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sleeper-mcp-${{ matrix.platform }}
+          path: sleeper-mcp-${{ matrix.platform }}${{ contains(matrix.platform, 'windows') && '.exe' || '' }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+
+      - name: Get latest release
+        id: get_release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const { data: release } = await github.rest.repos.getLatestRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo
+              });
+              core.setOutput('release_id', release.id);
+              core.setOutput('upload_url', release.upload_url);
+              core.setOutput('exists', 'true');
+              return release;
+            } catch (error) {
+              if (error.status === 404) {
+                core.setOutput('exists', 'false');
+                return null;
+              }
+              throw error;
+            }
+
+      - name: Create release if needed
+        if: steps.get_release.outputs.exists == 'false'
+        id: create_release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: release } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: context.ref.startsWith('refs/tags/') ? context.ref.replace('refs/tags/', '') : 'latest',
+              name: 'Latest Release',
+              body: 'Latest automated build',
+              draft: false,
+              prerelease: false
+            });
+            core.setOutput('release_id', release.id);
+            core.setOutput('upload_url', release.upload_url);
+            return release;
+
+      - name: Set release outputs
+        id: release
+        run: |
+          if [ "${{ steps.get_release.outputs.exists }}" = "true" ]; then
+            echo "upload_url=${{ steps.get_release.outputs.upload_url }}" >> $GITHUB_OUTPUT
+            echo "release_id=${{ steps.get_release.outputs.release_id }}" >> $GITHUB_OUTPUT
+          else
+            echo "upload_url=${{ steps.create_release.outputs.upload_url }}" >> $GITHUB_OUTPUT
+            echo "release_id=${{ steps.create_release.outputs.release_id }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload Linux x64 artifact to release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.release.outputs.upload_url }}
+          asset_path: artifacts/sleeper-mcp-linux-x64/sleeper-mcp-linux-x64
+          asset_name: sleeper-mcp-linux-x64
+          asset_content_type: application/octet-stream
+
+      - name: Upload Linux ARM64 artifact to release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.release.outputs.upload_url }}
+          asset_path: artifacts/sleeper-mcp-linux-arm64/sleeper-mcp-linux-arm64
+          asset_name: sleeper-mcp-linux-arm64
+          asset_content_type: application/octet-stream
+
+      - name: Upload macOS x64 artifact to release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.release.outputs.upload_url }}
+          asset_path: artifacts/sleeper-mcp-macos-x64/sleeper-mcp-macos-x64
+          asset_name: sleeper-mcp-macos-x64
+          asset_content_type: application/octet-stream
+
+      - name: Upload macOS ARM64 artifact to release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.release.outputs.upload_url }}
+          asset_path: artifacts/sleeper-mcp-macos-arm64/sleeper-mcp-macos-arm64
+          asset_name: sleeper-mcp-macos-arm64
+          asset_content_type: application/octet-stream
+
+      - name: Upload Windows x64 artifact to release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.release.outputs.upload_url }}
+          asset_path: artifacts/sleeper-mcp-windows-x64/sleeper-mcp-windows-x64.exe
+          asset_name: sleeper-mcp-windows-x64.exe
+          asset_content_type: application/octet-stream
