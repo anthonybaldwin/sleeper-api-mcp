@@ -42,117 +42,67 @@ A comprehensive Model Context Protocol (MCP) server for Sleeper fantasy football
 
 ## Installation
 
-### Prerequisites
-- Docker (or Docker Desktop)
-- Claude Desktop App
+### Quick Start (Recommended)
 
-### Setup
+1. **Download the executable** for your platform from the [latest release](https://github.com/anthonybaldwin/sleeper-api-mcp/releases/latest):
+   - **macOS (Apple Silicon)**: `sleeper-mcp-macos-arm64`
+   - **macOS (Intel)**: `sleeper-mcp-macos-x64`
+   - **Linux (x64)**: `sleeper-mcp-linux-x64`
+   - **Linux (ARM64)**: `sleeper-mcp-linux-arm64`
+   - **Windows**: `sleeper-mcp-windows-x64.exe`
 
-1. **Clone this repository** (or just download `compose.yaml`):
+2. **Make it executable** (macOS/Linux only):
 ```bash
-git clone https://github.com/anthonybaldwin/sleeper-api-mcp.git
-cd sleeper-api-mcp
+chmod +x sleeper-mcp-macos-arm64  # or whichever file you downloaded
 ```
 
-2. **Configure your Sleeper account details**:
-
-Edit `compose.yaml` with your Sleeper username and league IDs:
-```yaml
-environment:
-  SLEEPER_USERNAME_A: your_username
-  SLEEPER_LEAGUE_A_ID_1: your_league_id
-```
-
-3. **Start the container**:
-```bash
-docker-compose up -d
-# Pulls image from GitHub Container Registry
-# Container will be named 'sleeper-api-mcp'
-```
-
-#### Building Locally (Optional)
-
-If you want to build the image locally instead of using the pre-built one:
-
-1. Edit `compose.yaml` to use local build:
-```yaml
-# Comment out: image: ghcr.io/anthonybaldwin/sleeper-api-mcp:latest
-# Uncomment: build: .
-```
-
-2. Build and run:
-```bash
-docker-compose up -d --build
-```
-
-4. **Configure Claude Desktop**:
+3. **Configure Claude Desktop**:
 
 Edit your Claude Desktop configuration file:
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
 
 Add the following configuration:
 ```json
 {
   "mcpServers": {
     "sleeper": {
-      "command": "docker",
-      "args": ["exec", "-i", "sleeper-api-mcp", "node", "dist/index.js"]
+      "command": "/path/to/sleeper-mcp-macos-arm64",
+      "env": {
+        "SLEEPER_USERNAME_A": "your_username",
+        "SLEEPER_LEAGUE_A_ID_1": "1234567890123456789"
+      }
     }
   }
 }
 ```
-**Note**: Make sure the container is running first with `docker-compose up -d`
 
-5. **Restart Claude Desktop**
+Replace `/path/to/sleeper-mcp-macos-arm64` with the actual path to your downloaded executable, and update the environment variables with your Sleeper username and league ID.
 
-### Alternative: Using npm directly (no Docker)
-
-If you prefer to run without Docker:
-
-1. **Prerequisites**: Node.js 20+ installed
-
-2. **Setup**:
-```bash
-git clone https://github.com/anthonybaldwin/sleeper-api-mcp.git
-cd sleeper-api-mcp
-npm install
-npm run build
-
-# Create .env file with your config
-echo "SLEEPER_USERNAME_A=your_username" > .env
-echo "SLEEPER_LEAGUE_A_ID_1=your_league_id" >> .env
-```
-
-3. **Configure Claude Desktop**:
-```json
-{
-  "mcpServers": {
-    "sleeper": {
-      "command": "node",
-      "args": ["/path/to/sleeper-api-mcp/dist/index.js"]
-    }
-  }
-}
-```
+4. **Restart Claude Desktop**
 
 ## Configuration
 
 ### Multi-User/League Support
 
-The server supports multiple users and leagues. Configure them using environment variables with this pattern:
+The server supports multiple users and leagues. Add them to your Claude Desktop config:
 
-```env
-# User A
-SLEEPER_USERNAME_A=first_username
-SLEEPER_LEAGUE_A_ID_1=league_id_1
-SLEEPER_LEAGUE_A_ID_2=league_id_2
-
-# User B
-SLEEPER_USERNAME_B=second_username
-SLEEPER_LEAGUE_B_ID_1=another_league_id
-
-# Add more users (C, D, E...) as needed
+```json
+{
+  "mcpServers": {
+    "sleeper": {
+      "command": "/path/to/sleeper-mcp",
+      "env": {
+        "SLEEPER_USERNAME_A": "first_username",
+        "SLEEPER_LEAGUE_A_ID_1": "league_id_1",
+        "SLEEPER_LEAGUE_A_ID_2": "league_id_2",
+        "SLEEPER_USERNAME_B": "second_username",
+        "SLEEPER_LEAGUE_B_ID_1": "another_league_id"
+      }
+    }
+  }
+}
 ```
 
 The server will intelligently detect which league you're referring to based on context clues in your queries.
@@ -197,29 +147,31 @@ The trade analyzer evaluates:
 
 For developers who want to modify the code:
 
-### Option 1: npm (Fastest for development)
-```bash
-# Install dependencies
-npm install
+### Prerequisites
+- [Bun](https://bun.sh) installed
 
-# Create .env file with your config
+### Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/anthonybaldwin/sleeper-api-mcp.git
+cd sleeper-api-mcp
+
+# Install dependencies
+bun install
+
+# Create .env file with your config (optional, for development)
 cp .env.example .env
 # Edit .env with your Sleeper credentials
 
-# Build and run
-npm run build
-npm start
+# Run in development mode
+bun run dev
 
-# Or use watch mode for auto-rebuild
-npm run dev
+# Build executable
+bun run build
 ```
 
-### Option 2: Docker (Production-like)
-```bash
-# Edit compose.yaml with your credentials
-# Then build and run
-docker-compose up --build
-```
+The build command creates a standalone executable (`sleeper-mcp` or `sleeper-mcp.exe`) that includes all dependencies.
 
 ## API Reference
 
