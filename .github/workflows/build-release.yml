@@ -112,12 +112,14 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const tagName = context.ref.startsWith('refs/tags/') ? context.ref.replace('refs/tags/', '') : 'latest';
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const { data: release } = await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              tag_name: context.ref.startsWith('refs/tags/') ? context.ref.replace('refs/tags/', '') : 'latest',
-              name: 'Latest Release',
-              body: 'Latest automated build',
+              tag_name: tagName,
+              name: tagName,
+              body: `Automated build from [#${context.runNumber}](${runUrl})`,
               draft: false,
               prerelease: false
             });
