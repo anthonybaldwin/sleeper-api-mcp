@@ -86,7 +86,7 @@ jobs:
 
       - name: Get latest release
         id: get_release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
@@ -110,7 +110,7 @@ jobs:
       - name: Create release if needed
         if: steps.get_release.outputs.exists == 'false'
         id: create_release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
