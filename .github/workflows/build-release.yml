@@ -60,7 +60,7 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: sleeper-mcp-${{ matrix.platform }}
           path: sleeper-mcp-${{ matrix.platform }}${{ contains(matrix.platform, 'windows') && '.exe' || '' }}
