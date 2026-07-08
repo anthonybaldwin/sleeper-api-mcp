@@ -1,5 +1,9 @@
+import { Buffer } from "node:buffer";
+import { randomUUID } from "node:crypto";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -3147,12 +3151,222 @@ class SleeperMCPServer {
     };
   }
 
+  async connect(transport: StdioServerTransport | StreamableHTTPServerTransport) {
+    await this.server.connect(transport);
+  }
+
+  async close() {
+    await this.server.close();
+  }
+
   async run() {
     const transport = new StdioServerTransport();
-    await this.server.connect(transport);
+    await this.connect(transport);
     console.error("Sleeper MCP server running on stdio");
   }
 }
 
-const server = new SleeperMCPServer();
-server.run().catch(console.error);
+interface HttpSession {
+  server: SleeperMCPServer;
+  transport: StreamableHTTPServerTransport;
+}
+
+function getHeaderValue(header: string | string[] | undefined): string | undefined {
+  return Array.isArray(header) ? header[0] : header;
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function isInitializeRequestBody(body: unknown): boolean {
+  if (Array.isArray(body)) {
+    return body.some(isInitializeRequestBody);
+  }
+
+  return (
+    typeof body === "object" &&
+    body !== null &&
+    "method" in body &&
+    (body as { method?: unknown }).method === "initialize"
+  );
+}
+
+function sendJsonRpcError(
+  res: ServerResponse,
+  status: number,
+  code: number,
+  message: string,
+) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({
+    jsonrpc: "2.0",
+    error: { code, message },
+    id: null,
+  }));
+}
+
+async function handleHttpPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  sessions: Map<string, HttpSession>,
+) {
+  let body: unknown;
+
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    sendJsonRpcError(res, 400, -32700, "Parse error: Invalid JSON");
+    return;
+  }
+
+  const sessionId = getHeaderValue(req.headers["mcp-session-id"]);
+  if (sessionId) {
+    const session = sessions.get(sessionId);
+    if (!session) {
+      sendJsonRpcError(res, 404, -32001, "Session not found");
+      return;
+    }
+
+    await session.transport.handleRequest(req, res, body);
+    return;
+  }
+
+  if (!isInitializeRequestBody(body)) {
+    sendJsonRpcError(res, 400, -32000, "Bad Request: No valid session ID provided");
+    return;
+  }
+
+  const server = new SleeperMCPServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (newSessionId) => {
+      sessions.set(newSessionId, { server, transport });
+    },
+    onsessionclosed: (closedSessionId) => {
+      sessions.delete(closedSessionId);
+    },
+  });
+
+  transport.onclose = () => {
+    const closedSessionId = transport.sessionId;
+    if (closedSessionId) {
+      sessions.delete(closedSessionId);
+    }
+  };
+
+  await server.connect(transport);
+  await transport.handleRequest(req, res, body);
+
+  if (!transport.sessionId) {
+    await server.close();
+  }
+}
+
+async function handleHttpSessionRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  sessions: Map<string, HttpSession>,
+) {
+  const sessionId = getHeaderValue(req.headers["mcp-session-id"]);
+  if (!sessionId) {
+    sendJsonRpcError(res, 400, -32000, "Bad Request: Mcp-Session-Id header is required");
+    return;
+  }
+
+  const session = sessions.get(sessionId);
+  if (!session) {
+    sendJsonRpcError(res, 404, -32001, "Session not found");
+    return;
+  }
+
+  await session.transport.handleRequest(req, res);
+}
+
+async function handleHttpRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  sessions: Map<string, HttpSession>,
+) {
+  const url = new URL(req.url || "/", "http://localhost");
+
+  if (url.pathname !== "/mcp") {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not found");
+    return;
+  }
+
+  if (req.method === "POST") {
+    await handleHttpPost(req, res, sessions);
+    return;
+  }
+
+  if (req.method === "GET" || req.method === "DELETE") {
+    await handleHttpSessionRequest(req, res, sessions);
+    return;
+  }
+
+  res.writeHead(405, {
+    Allow: "GET, POST, DELETE",
+    "Content-Type": "text/plain",
+  });
+  res.end("Method not allowed");
+}
+
+async function runHttpServer() {
+  const host = process.env.MCP_HTTP_HOST || "127.0.0.1";
+  const port = Number.parseInt(process.env.MCP_HTTP_PORT || "3000", 10);
+
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid MCP_HTTP_PORT: ${process.env.MCP_HTTP_PORT}`);
+  }
+
+  const sessions = new Map<string, HttpSession>();
+  const httpServer = createServer((req, res) => {
+    handleHttpRequest(req, res, sessions).catch((error) => {
+      console.error("Error handling MCP HTTP request:", error);
+
+      if (!res.headersSent) {
+        sendJsonRpcError(res, 500, -32603, "Internal server error");
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(port, host, () => {
+      httpServer.off("error", reject);
+      console.error(`Sleeper MCP server running on http://${host}:${port}/mcp`);
+      resolve();
+    });
+  });
+}
+
+async function main() {
+  const transport = (process.env.MCP_TRANSPORT || "stdio").toLowerCase();
+
+  if (transport === "http") {
+    await runHttpServer();
+    return;
+  }
+
+  if (transport !== "stdio") {
+    throw new Error(`Unsupported MCP_TRANSPORT: ${process.env.MCP_TRANSPORT}`);
+  }
+
+  const server = new SleeperMCPServer();
+  await server.run();
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

@@ -107,6 +107,22 @@ The server supports multiple users and leagues. Add them to your Claude Desktop 
 
 The server will intelligently detect which league you're referring to based on context clues in your queries.
 
+### HTTP Transport (Optional)
+
+The server uses stdio by default. To run it with Streamable HTTP instead, set:
+
+```bash
+MCP_TRANSPORT=http
+MCP_HTTP_HOST=127.0.0.1
+MCP_HTTP_PORT=3000
+```
+
+The MCP endpoint will be available at:
+
+```text
+http://127.0.0.1:3000/mcp
+```
+
 ## Usage Examples
 
 ### Basic Queries
