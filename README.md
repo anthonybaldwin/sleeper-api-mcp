@@ -20,25 +20,48 @@ A comprehensive Model Context Protocol (MCP) server for Sleeper fantasy football
 
 ## Available Tools
 
-### Basic Tools
-- `get_user` - Get Sleeper user information by username
-- `get_user_leagues` - Get all leagues for a specific user
-- `get_league` - Get league information by league ID
-- `get_league_rosters` - Get all rosters in a league
-- `get_league_users` - Get all users in a league
-- `get_matchups` - Get matchups for a specific week
-- `get_transactions` - Get transactions for a specific week
-- `get_trending_players` - Get trending players (adds/drops)
-- `get_player_details` - Get details for specific players
-- `get_nfl_state` - Get current NFL season state
+All tools are read-only (annotated with `readOnlyHint`).
 
-### Advanced Tools
-- `analyze_trade` - Analyze trade risk and value between two teams
-- `preview_matchup` - Preview upcoming matchup with projections
-- `get_waiver_recommendations` - Get waiver wire recommendations
+### Your Teams (uses configured users/leagues)
+- `show_my_teams` - Show configured users, leagues, and roster IDs
+- `show_my_matchup` - Your matchup for any week (actual scores for past weeks, projections otherwise)
+- `show_my_opponent` - Details about your opponent for a week
+- `show_my_season_record` - Season matchup history and W/L record
+
+### Users & Leagues
+- `get_user` - Get Sleeper user information by username or user ID
+- `get_user_avatar` - Get a user's avatar URL (full size or thumbnail)
+- `get_user_leagues` - Get all leagues for a user
+- `get_league_info` - Get league information
+- `get_league_rosters` - Get all rosters in a league
+- `get_league_members` - Get all users in a league
+- `get_week_matchups` - Get raw matchups for a week
+- `get_matchup_scores` - Get formatted scores for every matchup in a week
+- `get_week_transactions` - Get transactions for a week
+- `get_league_traded_picks` - Get traded picks in a league
+- `get_winners_bracket` / `get_losers_bracket` - Get playoff brackets
+
+### Drafts
+- `get_user_drafts` - Get a user's drafts for a season
+- `get_league_drafts` - Get a league's drafts
+- `get_draft_info` - Get a draft
+- `get_draft_picks` - Get all picks in a draft
+- `get_draft_traded_picks` - Get traded picks in a draft
+
+### Players & NFL
+- `get_current_week` - Get current NFL season state
+- `get_player_details` - Get details for specific players
+- `get_trending_players` - Get trending players (adds/drops)
+- `get_player_stats` - Get a player's season or weekly stats
+- `get_weekly_projections` - Get weekly projections (optionally by position)
+
+### Analysis
+- `analyze_trade` - Analyze trade value, injury risk, and positional impact
+- `analyze_trade_targets` - Find trade targets for your roster's needs
+- `preview_matchup` - Preview a matchup with projections scored using your league's settings
+- `optimize_lineup` - Compare starters to bench using weekly projections
+- `suggest_waiver_pickups` - Waiver recommendations based on needs, trends, and projections
 - `get_free_agents` - Get available free agents
-- `analyze_lineup` - Analyze and optimize lineup
-- `get_player_projections` - Get player projections for a week
 
 ## Installation
 
@@ -167,6 +190,9 @@ cp .env.example .env
 # Run in development mode
 bun run dev
 
+# Typecheck
+bun run typecheck
+
 # Build executable
 bun run build
 ```
@@ -175,12 +201,13 @@ The build command creates a standalone executable (`sleeper-mcp` or `sleeper-mcp
 
 ## API Reference
 
-This server uses the public Sleeper API v1. No authentication is required. For more details, see the [Sleeper API documentation](https://docs.sleeper.app/).
+This server uses the public, read-only Sleeper API v1 (no authentication required); see the [Sleeper API documentation](https://docs.sleeper.com/). Stats and projections come from undocumented `api.sleeper.com` endpoints used by the Sleeper app, which may change without notice.
 
 ## Notes
 
 - Real-time data from Sleeper's API
-- Projections fetched from Sleeper's projection endpoints
-- Smart caching for current week data (5-minute cache)
-- Rate limiting to prevent API throttling
-- Supports PPR, Half-PPR, and Standard scoring
+- Projections are scored with your league's `scoring_settings` (falls back to PPR / Half-PPR / Standard totals)
+- Commissioner score overrides (`custom_points`) are respected
+- Player database (`/players/nfl`, ~5MB) is cached for 24 hours, per Sleeper's guidance
+- Current-week data cached for 5 minutes
+- Requests are spaced out to stay well under Sleeper's 1000 calls/minute limit

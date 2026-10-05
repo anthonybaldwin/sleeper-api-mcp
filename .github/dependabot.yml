@@ -1,60 +1,39 @@
 version: 2
 updates:
-  # Keep npm dependencies up to date
-  - package-ecosystem: "npm"
+  # Bun dependencies (package.json + bun.lock), all grouped into one PR
+  - package-ecosystem: "bun"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
+      day: "monday"
       time: "04:00"
     open-pull-requests-limit: 10
     groups:
-      # Group all npm development dependencies together
-      dev-dependencies:
-        dependency-type: "development"
-        patterns:
-          - "*"
-      # Group all npm production dependencies together
-      production-dependencies:
-        dependency-type: "production"
+      bun-dependencies:
         patterns:
           - "*"
     commit-message:
-      prefix: "npm"
+      prefix: "deps"
       include: "scope"
     labels:
       - "dependencies"
       - "javascript"
-    reviewers:
-      - "anthonybaldwin"
 
-  # Keep Docker dependencies up to date
-  - package-ecosystem: "docker"
-    directory: "/"
-    schedule:
-      interval: "daily"
-      time: "04:00"
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: "docker"
-      include: "scope"
-    labels:
-      - "dependencies"
-      - "docker"
-    reviewers:
-      - "anthonybaldwin"
-
-  # Keep GitHub Actions up to date (for future workflows)
+  # GitHub Actions, all grouped into one PR
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
+      day: "monday"
       time: "04:00"
     open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
     commit-message:
       prefix: "ci"
       include: "scope"
     labels:
       - "dependencies"
       - "github-actions"
-    reviewers:
-      - "anthonybaldwin"

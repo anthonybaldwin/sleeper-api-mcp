@@ -1,13 +1,12 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  Tool,
-} from "@modelcontextprotocol/sdk/types.js";
+import { McpServer, type CallToolResult } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { z } from "zod";
+import pkg from "../package.json" with { type: "json" };
 
 const SLEEPER_API_BASE = "https://api.sleeper.app/v1";
+// Unofficial endpoints used by the Sleeper web app (undocumented; may change)
 const SLEEPER_PROJECTIONS_BASE = "https://api.sleeper.com/projections/nfl";
+const SLEEPER_STATS_BASE = "https://api.sleeper.com/stats/nfl";
 const SLEEPER_AVATAR_BASE = "https://sleepercdn.com/avatars";
 const SLEEPER_AVATAR_THUMB_BASE = "https://sleepercdn.com/avatars/thumbs";
 
@@ -45,6 +44,35 @@ function safeStringify(data: any, replacer?: any, indent: number | string = 2): 
   }
 
   return result;
+}
+
+// Positions requested from the bulk projections endpoint
+const PROJECTION_POSITIONS = ["QB", "RB", "WR", "TE", "K", "DEF"];
+
+function scoringOrderBy(scoringSettings: Record<string, number> = {}): string {
+  if (scoringSettings.rec === 0.5) return "half_ppr";
+  if (scoringSettings.rec === 0) return "std";
+  return "ppr";
+}
+
+// Sleeper stat keys match scoring_settings keys, so points = sum(stat * weight).
+// Falls back to Sleeper's precomputed totals when no league settings match.
+function scoreStats(stats: Record<string, number>, scoringSettings: Record<string, number> = {}): number {
+  let points = 0;
+  for (const [key, weight] of Object.entries(scoringSettings)) {
+    const value = stats[key];
+    if (typeof value === "number" && typeof weight === "number") {
+      points += value * weight;
+    }
+  }
+  if (points !== 0) return Math.round(points * 100) / 100;
+
+  const fallback = scoringOrderBy(scoringSettings);
+  return stats[fallback === "half_ppr" ? "pts_half_ppr" : fallback === "std" ? "pts_std" : "pts_ppr"] || 0;
+}
+
+function textResult(data: unknown): CallToolResult {
+  return { content: [{ type: "text", text: safeStringify(data, null, 2) }] };
 }
 
 interface SleeperUser {
@@ -96,6 +124,12 @@ interface SleeperMatchup {
   starters: string[];
   players: string[];
   starters_points?: number[];
+  players_points?: Record<string, number>;
+  custom_points?: number | null; // Set when a commissioner manually overrides the score
+}
+
+function matchupPoints(m: SleeperMatchup): number {
+  return m.custom_points ?? m.points ?? 0;
 }
 
 interface SleeperPlayer {
@@ -162,10 +196,13 @@ interface SleeperTradedPick {
 interface SleeperBracketMatchup {
   r: number; // round
   m: number; // matchup
-  t1: number; // team 1 roster_id
-  t2: number; // team 2 roster_id
-  w?: number; // winner roster_id
-  l?: number; // loser roster_id
+  t1: number | null; // team 1 roster_id
+  t2: number | null; // team 2 roster_id
+  w?: number | null; // winner roster_id
+  l?: number | null; // loser roster_id
+  t1_from?: { w?: number; l?: number } | null; // t1 comes from winner/loser of matchup m
+  t2_from?: { w?: number; l?: number } | null;
+  p?: number; // placement decided by this matchup (1 = championship, 3 = 3rd place, ...)
 }
 
 interface NFLState {
@@ -188,14 +225,14 @@ interface UserConfig {
 }
 
 class SleeperMCPServer {
-  private server: Server;
   private playersCache: Map<string, SleeperPlayer> = new Map();
   private projectionsCache: Map<string, PlayerProjection> = new Map();
   private users: UserConfig[] = [];
   private currentSeason?: string; // Cached from NFL state
   private currentWeek?: number; // Cached current week
-  private lastRequestTime: number = 0;
-  private requestDelay: number = 100; // 100ms between requests for rate limiting
+  private playersCacheLoadedAt = 0;
+  private nextRequestTime = 0;
+  private requestDelay = 100; // 100ms between request starts for rate limiting
 
   // Cache for current week data only
   private currentWeekCache: {
@@ -213,24 +250,12 @@ class SleeperMCPServer {
   };
 
   private readonly CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+  // Sleeper asks that /players/nfl (~5MB) be fetched at most once per day
+  private readonly PLAYERS_CACHE_DURATION = 24 * 60 * 60 * 1000;
 
   constructor() {
     // Parse all users and leagues from environment variables
     this.parseEnvironmentConfig();
-
-    this.server = new Server(
-      {
-        name: "sleeper-api-mcp",
-        version: "1.0.0",
-      },
-      {
-        capabilities: {
-          tools: {},
-        },
-      },
-    );
-
-    this.setupHandlers();
 
     // Log configuration on startup
     console.error(`Loaded ${this.users.length} user(s) configuration:`);
@@ -293,30 +318,6 @@ class SleeperMCPServer {
     this.users = Array.from(userMap.values()).filter(u => u.username);
   }
 
-  private validateConfiguration() {
-    // Validate required environment variables
-    if (this.users.length === 0) {
-      throw new Error(
-        "No Sleeper configuration found! Please set at least SLEEPER_USERNAME_A and SLEEPER_LEAGUE_A_ID_1 in your environment. Edit compose.yaml with your Sleeper username and league ID."
-      );
-    }
-
-    const firstUser = this.users[0];
-    if (!firstUser.username || firstUser.leagues.length === 0) {
-      throw new Error(
-        "Invalid configuration! SLEEPER_USERNAME_A and SLEEPER_LEAGUE_A_ID_1 must both be set. Edit compose.yaml with your actual Sleeper username and league ID."
-      );
-    }
-
-    // Check if still using placeholder values
-    if (firstUser.username === 'your_sleeper_username' ||
-        firstUser.leagues[0].leagueId === 'your_league_id_1') {
-      throw new Error(
-        "Please update the placeholder values in compose.yaml! Replace 'your_sleeper_username' and 'your_league_id_1' with your actual Sleeper details."
-      );
-    }
-  }
-
   private async findUserAndLeague(hint?: string): Promise<{user: UserConfig, league: any, rosterId?: string} | null> {
     // Ensure we have at least basic configuration
     if (this.users.length === 0 || this.users[0].leagues.length === 0) {
@@ -349,9 +350,7 @@ class SleeperMCPServer {
             if (!league.leagueName) {
               // Fetch league name if not cached
               try {
-                await this.rateLimit();
-                const leagueInfoResponse = await fetch(`${SLEEPER_API_BASE}/league/${league.leagueId}`);
-                const leagueInfo = await leagueInfoResponse.json() as SleeperLeague;
+                const leagueInfo = await this.getJson<SleeperLeague>(`${SLEEPER_API_BASE}/league/${league.leagueId}`);
                 league.leagueName = leagueInfo.name;
               } catch (e) {
                 console.error('Error fetching league name:', e);
@@ -371,8 +370,7 @@ class SleeperMCPServer {
         for (const league of user.leagues) {
           if (!league.leagueName) {
             try {
-              const leagueInfoResponse = await fetch(`${SLEEPER_API_BASE}/league/${league.leagueId}`);
-              const leagueInfo = await leagueInfoResponse.json() as SleeperLeague;
+              const leagueInfo = await this.getJson<SleeperLeague>(`${SLEEPER_API_BASE}/league/${league.leagueId}`);
               league.leagueName = leagueInfo.name;
             } catch (e) {
               console.error('Error fetching league name:', e);
@@ -399,24 +397,18 @@ class SleeperMCPServer {
     if (!league.rosterId) {
       try {
         if (!user.userId) {
-          await this.rateLimit();
-          const userInfoResponse = await fetch(`${SLEEPER_API_BASE}/user/${user.username}`);
-          const userInfo = await userInfoResponse.json() as SleeperUser;
+          const userInfo = await this.getJson<SleeperUser>(`${SLEEPER_API_BASE}/user/${user.username}`);
           user.userId = userInfo.user_id;
         }
 
-        await this.rateLimit();
-        const rostersResponse = await fetch(`${SLEEPER_API_BASE}/league/${league.leagueId}/rosters`);
-        const rosters = await rostersResponse.json() as SleeperRoster[];
+        const rosters = await this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/rosters`);
 
         // First try to find by owner_id
         let roster = rosters.find(r => r.owner_id === user.userId);
 
         // If not found, try to match by fetching league users
         if (!roster && rosters.length > 0) {
-          await this.rateLimit();
-          const leagueUsersResponse = await fetch(`${SLEEPER_API_BASE}/league/${league.leagueId}/users`);
-          const leagueUsers = await leagueUsersResponse.json() as SleeperUser[];
+          const leagueUsers = await this.getJson<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/users`);
 
           // League users have display_name, not username
           const leagueUser = leagueUsers.find(u =>
@@ -446,9 +438,7 @@ class SleeperMCPServer {
     for (const user of this.users) {
       if (!user.userId) {
         try {
-          await this.rateLimit();
-          const userInfoResponse = await fetch(`${SLEEPER_API_BASE}/user/${user.username}`);
-          const userInfo = await userInfoResponse.json() as SleeperUser;
+          const userInfo = await this.getJson<SleeperUser>(`${SLEEPER_API_BASE}/user/${user.username}`);
           user.userId = userInfo.user_id;
         } catch (e) {
           console.error(`Error fetching user ID for ${user.username}:`, e);
@@ -457,13 +447,25 @@ class SleeperMCPServer {
     }
   }
 
+  // Space out request start times. Sleeper asks clients to stay under 1000 calls/minute.
   private async rateLimit(): Promise<void> {
     const now = Date.now();
-    const timeSinceLastRequest = now - this.lastRequestTime;
-    if (timeSinceLastRequest < this.requestDelay) {
-      await new Promise(resolve => setTimeout(resolve, this.requestDelay - timeSinceLastRequest));
+    const slot = Math.max(now, this.nextRequestTime);
+    this.nextRequestTime = slot + this.requestDelay;
+    if (slot > now) {
+      await new Promise(resolve => setTimeout(resolve, slot - now));
     }
-    this.lastRequestTime = Date.now();
+  }
+
+  private async getJson<T = any>(url: string): Promise<T> {
+    await this.rateLimit();
+    const response = await fetch(url, {
+      headers: { "User-Agent": `sleeper-api-mcp/${pkg.version}` },
+    });
+    if (!response.ok) {
+      throw new Error(`Sleeper API request failed (${response.status} ${response.statusText}): ${url}`);
+    }
+    return await response.json() as T;
   }
 
   private isCacheValid(): boolean {
@@ -479,777 +481,221 @@ class SleeperMCPServer {
     }
   }
 
-  private setupHandlers() {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: this.getTools(),
-    }));
-
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request.params;
-
-      try {
-        // Validate configuration on first actual request
-        if (this.users.length === 0 ||
-            (this.users.length === 1 && this.users[0].username === 'your_sleeper_username')) {
-          this.validateConfiguration();
-        }
-        switch (name) {
-          case "get_user":
-            return await this.getUser(args?.username as string);
-          case "get_user_leagues":
-            const season1 = args?.season as string || await this.getCurrentSeason();
-            return await this.getUserLeagues(
-              args?.user_id as string,
-              args?.sport as string | undefined,
-              season1,
-            );
-          case "get_league_info":
-            return await this.getLeague(args?.league_id as string);
-          case "get_league_rosters":
-            return await this.getLeagueRosters(args?.league_id as string);
-          case "get_league_members":
-            return await this.getLeagueUsers(args?.league_id as string);
-          case "get_week_matchups":
-            return await this.getMatchups(
-              args?.league_id as string,
-              args?.week as number,
-            );
-          case "get_week_transactions":
-            return await this.getTransactions(
-              args?.league_id as string,
-              args?.week as number,
-            );
-          case "get_trending_players":
-            return await this.getTrendingPlayers(
-              args?.sport as string | undefined,
-              args?.type as string,
-              args?.lookback_hours as number | undefined,
-              args?.limit as number | undefined,
-            );
-          case "get_player_details":
-            return await this.getPlayerDetails(args?.player_ids as string[]);
-          case "get_current_week":
-            return await this.getNFLState();
-          case "analyze_trade":
-            return await this.analyzeTrade(
-              args?.league_id as string,
-              args?.roster_id_1 as number,
-              args?.roster_id_2 as number,
-              args?.players_from_1 as string[],
-              args?.players_from_2 as string[],
-            );
-          case "suggest_waiver_pickups":
-            return await this.getWaiverRecommendations(
-              args?.league_id as string,
-              args?.roster_id as number,
-              args?.position as string | undefined,
-              args?.limit as number | undefined,
-            );
-          case "preview_matchup":
-            return await this.previewMatchup(
-              args?.league_id as string,
-              args?.week as number,
-              args?.roster_id as number,
-            );
-          case "get_free_agents":
-            return await this.getFreeAgents(
-              args?.league_id as string,
-              args?.position as string | undefined,
-            );
-          case "optimize_lineup":
-            return await this.analyzeLineup(
-              args?.league_id as string,
-              args?.roster_id as number,
-              args?.week as number,
-            );
-          case "get_weekly_projections":
-            const season2 = args?.season as string || await this.getCurrentSeason();
-            return await this.getPlayerProjections(
-              season2,
-              args?.week as number,
-              args?.position as string | undefined,
-            );
-          case "show_my_teams":
-            return await this.getMyInfo();
-          case "show_my_matchup":
-            return await this.getMyMatchup(
-              args?.week as number | undefined,
-              args?.league_hint as string | undefined
-            );
-          case "show_my_season_record":
-            return await this.getMySeasonHistory(args?.league_hint as string | undefined);
-          case "show_my_opponent":
-            return await this.getMyOpponent(
-              args?.week as number | undefined,
-              args?.league_hint as string | undefined
-            );
-          case "get_user_avatar":
-            return await this.getAvatarUrl(
-              args?.username as string | undefined,
-              args?.user_id as string | undefined,
-              args?.thumbnail as boolean | undefined,
-            );
-          // Draft tools
-          case "get_user_drafts":
-            const season3 = args?.season as string || await this.getCurrentSeason();
-            return await this.getUserDrafts(
-              args?.user_id as string,
-              args?.sport as string || "nfl",
-              season3,
-            );
-          case "get_league_drafts":
-            return await this.getLeagueDrafts(args?.league_id as string);
-          case "get_draft_info":
-            return await this.getDraftInfo(args?.draft_id as string);
-          case "get_draft_picks":
-            return await this.getDraftPicks(args?.draft_id as string);
-          case "get_draft_traded_picks":
-            return await this.getDraftTradedPicks(args?.draft_id as string);
-          // Bracket tools
-          case "get_winners_bracket":
-            return await this.getWinnersBracket(args?.league_id as string);
-          case "get_losers_bracket":
-            return await this.getLosersBracket(args?.league_id as string);
-          // Traded picks
-          case "get_league_traded_picks":
-            return await this.getLeagueTradedPicks(args?.league_id as string);
-          // NFL State
-          case "get_current_week":
-            return await this.getNFLState();
-          // Advanced analytics
-          case "get_matchup_scores":
-            return await this.getMatchupScores(
-              args?.league_id as string,
-              args?.week as number,
-            );
-          case "analyze_trade_targets":
-            return await this.analyzeTradeTargets(
-              args?.league_id as string,
-              args?.roster_id as number,
-            );
-          case "get_player_stats":
-            const season4 = args?.season as string || await this.getCurrentSeason();
-            return await this.getPlayerStats(
-              args?.player_id as string,
-              season4,
-              args?.week as number | undefined,
-            );
-          default:
-            throw new Error(`Unknown tool: ${name}`);
-        }
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Error: ${error.message}`,
-            },
-          ],
-        };
-      }
+  // Builds an MCP server bound to this instance's shared config and caches
+  createServer(): McpServer {
+    const server = new McpServer({
+      name: "sleeper-api-mcp",
+      title: "Sleeper Fantasy Football",
+      version: pkg.version,
     });
+    this.registerTools(server);
+    return server;
   }
 
-  private getTools(): Tool[] {
-    return [
-      {
-        name: "get_user",
-        description: "Get Sleeper user information by username",
-        inputSchema: {
-          type: "object",
-          properties: {
-            username: {
-              type: "string",
-              description: "Sleeper username",
-            },
-          },
-          required: ["username"],
+  private registerTools(server: McpServer) {
+    const tool = <S extends z.ZodRawShape>(
+      name: string,
+      title: string,
+      description: string,
+      inputSchema: S,
+      handler: (args: z.infer<z.ZodObject<S>>) => Promise<CallToolResult>,
+    ) => {
+      server.registerTool(
+        name,
+        {
+          title,
+          description,
+          inputSchema: z.object(inputSchema),
+          annotations: { readOnlyHint: true, openWorldHint: true },
         },
-      },
+        (async (args: z.infer<z.ZodObject<S>>) => {
+          try {
+            return await handler(args);
+          } catch (error: any) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `Error: ${error.message}` }],
+            };
+          }
+        }) as any,
+      );
+    };
+
+    const leagueId = z.string().describe("Sleeper league ID");
+    const draftId = z.string().describe("Draft ID");
+    const week = z.number().int().min(0).max(25).describe("Week number (1-18 regular season, playoffs after)");
+    const optionalWeek = week.optional().describe("Week number (optional, defaults to current week)");
+    const season = z.string().optional().describe("Season year, e.g. 2025 (defaults to current season)");
+    const sport = z.string().optional().describe("Sport (default: nfl)");
+    const rosterId = z.number().int().describe("Roster ID");
+    const leagueHint = z.string().optional().describe("League name, league ID, or username hint to identify which league (optional)");
+
+    tool("get_user", "Get User", "Get Sleeper user information by username or user ID",
+      { username: z.string().describe("Sleeper username or user ID") },
+      (a) => this.getUser(a.username));
+
+    tool("get_user_leagues", "Get User Leagues", "Get all leagues for a specific user",
+      { user_id: z.string().describe("Sleeper user ID"), sport, season },
+      async (a) => this.getUserLeagues(a.user_id, a.sport, a.season || await this.getCurrentSeason()));
+
+    tool("get_league_info", "Get League Info", "Get league information by league ID",
+      { league_id: leagueId },
+      (a) => this.getLeague(a.league_id));
+
+    tool("get_league_rosters", "Get League Rosters", "Get all rosters in a league",
+      { league_id: leagueId },
+      (a) => this.getLeagueRosters(a.league_id));
+
+    tool("get_league_members", "Get League Members", "Get all users in a league",
+      { league_id: leagueId },
+      (a) => this.getLeagueUsers(a.league_id));
+
+    tool("get_week_matchups", "Get Week Matchups", "Get raw matchups for a specific week in a league",
+      { league_id: leagueId, week },
+      (a) => this.getMatchups(a.league_id, a.week));
+
+    tool("get_week_transactions", "Get Week Transactions", "Get transactions for a specific week (round) in a league",
+      { league_id: leagueId, week },
+      (a) => this.getTransactions(a.league_id, a.week));
+
+    tool("get_trending_players", "Get Trending Players", "Get trending players being added/dropped",
       {
-        name: "get_user_leagues",
-        description: "Get all leagues for a specific user",
-        inputSchema: {
-          type: "object",
-          properties: {
-            user_id: {
-              type: "string",
-              description: "Sleeper user ID",
-            },
-            sport: {
-              type: "string",
-              description: "Sport (e.g., nfl)",
-              default: "nfl",
-            },
-            season: {
-              type: "string",
-              description: "Season year (e.g., 2024)",
-            },
-          },
-          required: ["user_id", "season"],
-        },
+        sport,
+        type: z.enum(["add", "drop"]).describe("Trend type: add or drop"),
+        lookback_hours: z.number().int().positive().optional().describe("Hours to look back (default: 24)"),
+        limit: z.number().int().positive().optional().describe("Number of results to return (default: 25)"),
       },
+      (a) => this.getTrendingPlayers(a.sport, a.type, a.lookback_hours, a.limit));
+
+    tool("get_player_details", "Get Player Details", "Get details for specific players by their IDs",
+      { player_ids: z.array(z.string()).describe("Array of player IDs") },
+      (a) => this.getPlayerDetails(a.player_ids));
+
+    tool("get_current_week", "Get Current Week", "Get the current NFL state (week, season, season type, etc.)",
+      {},
+      () => this.getNFLState());
+
+    tool("show_my_teams", "Show My Teams", "Get your configured users, leagues, and roster IDs",
+      {},
+      () => this.getMyInfo());
+
+    tool("show_my_matchup", "Show My Matchup",
+      "Get YOUR matchup for any week - past (shows actual scores) or future (shows projections)",
+      { week: optionalWeek, league_hint: leagueHint },
+      (a) => this.getMyMatchup(a.week, a.league_hint));
+
+    tool("show_my_season_record", "Show My Season Record",
+      "Get your full season matchup history with scores and W/L record",
+      { league_hint: leagueHint },
+      (a) => this.getMySeasonHistory(a.league_hint));
+
+    tool("show_my_opponent", "Show My Opponent",
+      "Get detailed info about your opponent for any week including avatar",
+      { week: optionalWeek, league_hint: leagueHint },
+      (a) => this.getMyOpponent(a.week, a.league_hint));
+
+    tool("get_user_avatar", "Get User Avatar", "Get avatar URL for any user (full size or thumbnail)",
       {
-        name: "get_league_info",
-        description: "Get league information by league ID",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "Sleeper league ID",
-            },
-          },
-          required: ["league_id"],
-        },
+        username: z.string().optional().describe("Username (optional if user_id provided)"),
+        user_id: z.string().optional().describe("User ID (optional if username provided)"),
+        thumbnail: z.boolean().optional().describe("Get thumbnail version (default: false)"),
       },
+      (a) => this.getAvatarUrl(a.username, a.user_id, a.thumbnail));
+
+    tool("analyze_trade", "Analyze Trade",
+      "Evaluate trade fairness with comprehensive player values and positional impact analysis",
       {
-        name: "get_league_rosters",
-        description: "Get all rosters in a league",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "Sleeper league ID",
-            },
-          },
-          required: ["league_id"],
-        },
+        league_id: leagueId,
+        roster_id_1: z.number().int().describe("First roster ID in trade"),
+        roster_id_2: z.number().int().describe("Second roster ID in trade"),
+        players_from_1: z.array(z.string()).describe("Player IDs going from roster 1 to roster 2"),
+        players_from_2: z.array(z.string()).describe("Player IDs going from roster 2 to roster 1"),
       },
+      (a) => this.analyzeTrade(a.league_id, a.roster_id_1, a.roster_id_2, a.players_from_1, a.players_from_2));
+
+    tool("suggest_waiver_pickups", "Suggest Waiver Pickups", "Get waiver wire recommendations based on team needs",
       {
-        name: "get_league_members",
-        description: "Get all users in a league",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "Sleeper league ID",
-            },
-          },
-          required: ["league_id"],
-        },
+        league_id: leagueId,
+        roster_id: rosterId.describe("Roster ID to get recommendations for"),
+        position: z.string().optional().describe("Position to focus on (optional)"),
+        limit: z.number().int().positive().optional().describe("Number of recommendations (default: 10)"),
       },
+      (a) => this.getWaiverRecommendations(a.league_id, a.roster_id, a.position, a.limit));
+
+    tool("preview_matchup", "Preview Matchup", "Preview upcoming matchup with projections and analysis",
+      { league_id: leagueId, week, roster_id: rosterId.describe("Your roster ID") },
+      (a) => this.previewMatchup(a.league_id, a.week, a.roster_id));
+
+    tool("get_free_agents", "Get Free Agents", "Get available free agents in a league",
+      { league_id: leagueId, position: z.string().optional().describe("Filter by position (optional)") },
+      (a) => this.getFreeAgents(a.league_id, a.position));
+
+    tool("optimize_lineup", "Optimize Lineup", "Analyze and optimize lineup for a specific week using projections",
+      { league_id: leagueId, roster_id: rosterId.describe("Roster ID to analyze"), week },
+      (a) => this.analyzeLineup(a.league_id, a.roster_id, a.week));
+
+    tool("get_weekly_projections", "Get Weekly Projections", "Get player projections for a specific week",
+      { season, week, position: z.string().optional().describe("Position filter, e.g. QB (optional)") },
+      async (a) => this.getPlayerProjections(a.season || await this.getCurrentSeason(), a.week, a.position));
+
+    // Draft tools
+    tool("get_user_drafts", "Get User Drafts", "Get all drafts for a user for a specific sport and season",
+      { user_id: z.string().describe("User ID"), sport, season },
+      async (a) => this.getUserDrafts(a.user_id, a.sport || "nfl", a.season || await this.getCurrentSeason()));
+
+    tool("get_league_drafts", "Get League Drafts", "Get all drafts for a league",
+      { league_id: leagueId },
+      (a) => this.getLeagueDrafts(a.league_id));
+
+    tool("get_draft_info", "Get Draft Info", "Get information about a specific draft",
+      { draft_id: draftId },
+      (a) => this.getDraftInfo(a.draft_id));
+
+    tool("get_draft_picks", "Get Draft Picks", "Get all picks in a draft",
+      { draft_id: draftId },
+      (a) => this.getDraftPicks(a.draft_id));
+
+    tool("get_draft_traded_picks", "Get Draft Traded Picks", "Get all traded picks in a draft",
+      { draft_id: draftId },
+      (a) => this.getDraftTradedPicks(a.draft_id));
+
+    // Bracket tools
+    tool("get_winners_bracket", "Get Winners Bracket", "Get the playoff winners bracket for a league",
+      { league_id: leagueId },
+      (a) => this.getWinnersBracket(a.league_id));
+
+    tool("get_losers_bracket", "Get Losers Bracket", "Get the playoff losers bracket for a league",
+      { league_id: leagueId },
+      (a) => this.getLosersBracket(a.league_id));
+
+    // Traded picks
+    tool("get_league_traded_picks", "Get League Traded Picks", "Get all traded picks in a league",
+      { league_id: leagueId },
+      (a) => this.getLeagueTradedPicks(a.league_id));
+
+    // Advanced analytics
+    tool("get_matchup_scores", "Get Matchup Scores", "Get real-time scoring information for matchups in a specific week",
+      { league_id: leagueId, week },
+      (a) => this.getMatchupScores(a.league_id, a.week));
+
+    tool("analyze_trade_targets", "Analyze Trade Targets",
+      "Identify optimal trade targets based on your roster's strengths and weaknesses",
+      { league_id: leagueId, roster_id: rosterId.describe("Your roster ID") },
+      (a) => this.analyzeTradeTargets(a.league_id, a.roster_id));
+
+    tool("get_player_stats", "Get Player Stats", "Get detailed stats for a specific player",
       {
-        name: "get_week_matchups",
-        description: "Get matchups for a specific week in a league",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "Sleeper league ID",
-            },
-            week: {
-              type: "number",
-              description: "Week number (1-18 for NFL)",
-            },
-          },
-          required: ["league_id", "week"],
-        },
+        player_id: z.string().describe("Player ID"),
+        season,
+        week: week.optional().describe("Week number (optional, omit for season totals)"),
       },
-      {
-        name: "get_week_transactions",
-        description: "Get transactions for a specific week in a league",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "Sleeper league ID",
-            },
-            week: {
-              type: "number",
-              description: "Week number (1-18 for NFL)",
-            },
-          },
-          required: ["league_id", "week"],
-        },
-      },
-      {
-        name: "get_trending_players",
-        description: "Get trending players being added/dropped",
-        inputSchema: {
-          type: "object",
-          properties: {
-            sport: {
-              type: "string",
-              description: "Sport (e.g., nfl)",
-              default: "nfl",
-            },
-            type: {
-              type: "string",
-              description: "Trend type: add or drop",
-              enum: ["add", "drop"],
-            },
-            lookback_hours: {
-              type: "number",
-              description: "Hours to look back (e.g., 24)",
-              default: 24,
-            },
-            limit: {
-              type: "number",
-              description: "Number of results to return",
-              default: 25,
-            },
-          },
-          required: ["type"],
-        },
-      },
-      {
-        name: "get_player_details",
-        description: "Get details for specific players by their IDs",
-        inputSchema: {
-          type: "object",
-          properties: {
-            player_ids: {
-              type: "array",
-              items: {
-                type: "string",
-              },
-              description: "Array of player IDs",
-            },
-          },
-          required: ["player_ids"],
-        },
-      },
-      {
-        name: "get_current_week",
-        description: "Get current NFL season state including week",
-        inputSchema: {
-          type: "object",
-          properties: {},
-        },
-      },
-      {
-        name: "show_my_teams",
-        description:
-          "Get your configured default settings (username, league ID, user ID)",
-        inputSchema: {
-          type: "object",
-          properties: {},
-        },
-      },
-      {
-        name: "show_my_matchup",
-        description:
-          "Get YOUR matchup for any week - past (shows actual scores) or future (shows projections)",
-        inputSchema: {
-          type: "object",
-          properties: {
-            week: {
-              type: "number",
-              description: "Week number 1-18 (optional, defaults to current week)",
-            },
-            league_hint: {
-              type: "string",
-              description: "League name or username hint to identify which league (optional)",
-            },
-          },
-        },
-      },
-      {
-        name: "show_my_season_record",
-        description:
-          "Get your full season matchup history with scores and W/L record",
-        inputSchema: {
-          type: "object",
-          properties: {},
-        },
-      },
-      {
-        name: "show_my_opponent",
-        description:
-          "Get detailed info about your opponent for any week including avatar",
-        inputSchema: {
-          type: "object",
-          properties: {
-            week: {
-              type: "number",
-              description: "Week number (optional, defaults to current week)",
-            },
-          },
-        },
-      },
-      {
-        name: "get_user_avatar",
-        description:
-          "Get avatar URL for any user (full size or thumbnail)",
-        inputSchema: {
-          type: "object",
-          properties: {
-            username: {
-              type: "string",
-              description: "Username (optional if user_id provided)",
-            },
-            user_id: {
-              type: "string",
-              description: "User ID (optional if username provided)",
-            },
-            thumbnail: {
-              type: "boolean",
-              description: "Get thumbnail version (default: false)",
-            },
-          },
-        },
-      },
-      {
-        name: "analyze_trade",
-        description: "Evaluate trade fairness with comprehensive player values and positional impact analysis",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "Sleeper league ID",
-            },
-            roster_id_1: {
-              type: "number",
-              description: "First roster ID in trade",
-            },
-            roster_id_2: {
-              type: "number",
-              description: "Second roster ID in trade",
-            },
-            players_from_1: {
-              type: "array",
-              items: { type: "string" },
-              description: "Player IDs going from roster 1 to roster 2",
-            },
-            players_from_2: {
-              type: "array",
-              items: { type: "string" },
-              description: "Player IDs going from roster 2 to roster 1",
-            },
-          },
-          required: [
-            "league_id",
-            "roster_id_1",
-            "roster_id_2",
-            "players_from_1",
-            "players_from_2",
-          ],
-        },
-      },
-      {
-        name: "suggest_waiver_pickups",
-        description: "Get waiver wire recommendations based on team needs",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "Sleeper league ID",
-            },
-            roster_id: {
-              type: "number",
-              description: "Roster ID to get recommendations for",
-            },
-            position: {
-              type: "string",
-              description: "Position to focus on (optional)",
-            },
-            limit: {
-              type: "number",
-              description: "Number of recommendations",
-              default: 10,
-            },
-          },
-          required: ["league_id", "roster_id"],
-        },
-      },
-      {
-        name: "preview_matchup",
-        description: "Preview upcoming matchup with projections and analysis",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "Sleeper league ID",
-            },
-            week: {
-              type: "number",
-              description: "Week number",
-            },
-            roster_id: {
-              type: "number",
-              description: "Your roster ID",
-            },
-          },
-          required: ["league_id", "week", "roster_id"],
-        },
-      },
-      {
-        name: "get_free_agents",
-        description: "Get available free agents in a league",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "Sleeper league ID",
-            },
-            position: {
-              type: "string",
-              description: "Filter by position (optional)",
-            },
-          },
-          required: ["league_id"],
-        },
-      },
-      {
-        name: "optimize_lineup",
-        description: "Analyze and optimize lineup for a specific week",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "Sleeper league ID",
-            },
-            roster_id: {
-              type: "number",
-              description: "Roster ID to analyze",
-            },
-            week: {
-              type: "number",
-              description: "Week number",
-            },
-          },
-          required: ["league_id", "roster_id", "week"],
-        },
-      },
-      {
-        name: "get_weekly_projections",
-        description: "Get player projections for a specific week",
-        inputSchema: {
-          type: "object",
-          properties: {
-            season: {
-              type: "string",
-              description: "Season year",
-            },
-            week: {
-              type: "number",
-              description: "Week number",
-            },
-            position: {
-              type: "string",
-              description: "Position filter (optional)",
-            },
-          },
-          required: ["season", "week"],
-        },
-      },
-      // Draft tools
-      {
-        name: "get_user_drafts",
-        description: "Get all drafts for a user for a specific sport and season",
-        inputSchema: {
-          type: "object",
-          properties: {
-            user_id: {
-              type: "string",
-              description: "User ID",
-            },
-            sport: {
-              type: "string",
-              description: "Sport (default: nfl)",
-            },
-            season: {
-              type: "string",
-              description: "Season year (defaults to current season)",
-            },
-          },
-          required: ["user_id"],
-        },
-      },
-      {
-        name: "get_league_drafts",
-        description: "Get all drafts for a league",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "League ID",
-            },
-          },
-          required: ["league_id"],
-        },
-      },
-      {
-        name: "get_draft_info",
-        description: "Get information about a specific draft",
-        inputSchema: {
-          type: "object",
-          properties: {
-            draft_id: {
-              type: "string",
-              description: "Draft ID",
-            },
-          },
-          required: ["draft_id"],
-        },
-      },
-      {
-        name: "get_draft_picks",
-        description: "Get all picks in a draft",
-        inputSchema: {
-          type: "object",
-          properties: {
-            draft_id: {
-              type: "string",
-              description: "Draft ID",
-            },
-          },
-          required: ["draft_id"],
-        },
-      },
-      {
-        name: "get_draft_traded_picks",
-        description: "Get all traded picks in a draft",
-        inputSchema: {
-          type: "object",
-          properties: {
-            draft_id: {
-              type: "string",
-              description: "Draft ID",
-            },
-          },
-          required: ["draft_id"],
-        },
-      },
-      // Bracket tools
-      {
-        name: "get_winners_bracket",
-        description: "Get the playoff winners bracket for a league",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "League ID",
-            },
-          },
-          required: ["league_id"],
-        },
-      },
-      {
-        name: "get_losers_bracket",
-        description: "Get the playoff losers bracket for a league",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "League ID",
-            },
-          },
-          required: ["league_id"],
-        },
-      },
-      // Traded picks
-      {
-        name: "get_league_traded_picks",
-        description: "Get all traded picks in a league",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "League ID",
-            },
-          },
-          required: ["league_id"],
-        },
-      },
-      // NFL State
-      {
-        name: "get_current_week",
-        description: "Get the current NFL state (week, season, etc.)",
-        inputSchema: {
-          type: "object",
-          properties: {},
-        },
-      },
-      // Advanced analytics
-      {
-        name: "get_matchup_scores",
-        description: "Get real-time scoring information for matchups in a specific week",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "League ID",
-            },
-            week: {
-              type: "number",
-              description: "Week number",
-            },
-          },
-          required: ["league_id", "week"],
-        },
-      },
-      {
-        name: "analyze_trade_targets",
-        description: "Identify optimal trade targets based on your roster's strengths and weaknesses",
-        inputSchema: {
-          type: "object",
-          properties: {
-            league_id: {
-              type: "string",
-              description: "League ID",
-            },
-            roster_id: {
-              type: "number",
-              description: "Your roster ID",
-            },
-          },
-          required: ["league_id", "roster_id"],
-        },
-      },
-      {
-        name: "get_player_stats",
-        description: "Get detailed stats for a specific player",
-        inputSchema: {
-          type: "object",
-          properties: {
-            player_id: {
-              type: "string",
-              description: "Player ID",
-            },
-            season: {
-              type: "string",
-              description: "Season year (defaults to current season)",
-            },
-            week: {
-              type: "number",
-              description: "Week number (optional, omit for season totals)",
-            },
-          },
-          required: ["player_id"],
-        },
-      },
-    ];
+      async (a) => this.getPlayerStats(a.player_id, a.season || await this.getCurrentSeason(), a.week));
   }
 
   private async getUser(username: string) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/user/${username}`,
-    );
-    const data = await response.json() as SleeperUser;
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperUser | null>(`${SLEEPER_API_BASE}/user/${encodeURIComponent(username)}`);
+    if (!data) throw new Error(`User not found: ${username}`);
+    return textResult(data);
   }
 
   private async getUserLeagues(
@@ -1257,92 +703,38 @@ class SleeperMCPServer {
     sport: string = "nfl",
     season: string,
   ) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/user/${userId}/leagues/${sport}/${season}`,
-    );
-    const data = await response.json() as SleeperLeague[];
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperLeague[]>(`${SLEEPER_API_BASE}/user/${userId}/leagues/${sport}/${season}`);
+    return textResult(data);
   }
 
   private async getLeague(leagueId: string) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/league/${leagueId}`,
-    );
-    const data = await response.json() as SleeperLeague;
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperLeague>(`${SLEEPER_API_BASE}/league/${leagueId}`);
+    return textResult(data);
   }
 
   private async getLeagueRosters(leagueId: string) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/league/${leagueId}/rosters`,
-    );
-    const data = await response.json() as SleeperRoster[];
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`);
+    return textResult(data);
   }
 
   private async getLeagueUsers(leagueId: string) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/league/${leagueId}/users`,
-    );
-    const data = await response.json() as SleeperUser[];
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${leagueId}/users`);
+    return textResult(data);
   }
 
   private async getMatchups(leagueId: string, week: number) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/league/${leagueId}/matchups/${week}`,
-    );
-    const data = await response.json() as SleeperMatchup[];
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperMatchup[]>(`${SLEEPER_API_BASE}/league/${leagueId}/matchups/${week}`);
+    return textResult(data);
   }
 
   private async getTransactions(leagueId: string, week: number) {
     await this.loadPlayersCache();
 
-    const [transactionsResponse, rostersResponse, usersResponse] = await Promise.all([
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/transactions/${week}`),
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
+    const [transactions, rosters, users] = await Promise.all([
+      this.getJson<SleeperTransaction[]>(`${SLEEPER_API_BASE}/league/${leagueId}/transactions/${week}`),
+      this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
+      this.getJson<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
     ]);
-
-    const transactions = await transactionsResponse.json() as SleeperTransaction[];
-    const rosters = await rostersResponse.json() as SleeperRoster[];
-    const users = await usersResponse.json() as SleeperUser[];
 
     // Create roster ID to team name mapping
     const rosterToTeam = new Map<number, string>();
@@ -1431,11 +823,7 @@ class SleeperMCPServer {
       (t.waiver_budget && t.waiver_budget[0] > 10)
     );
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify({
+    return textResult({
             week,
             total_transactions: formattedTransactions.length,
             transactions: formattedTransactions,
@@ -1443,10 +831,7 @@ class SleeperMCPServer {
             news_instruction: significantTransactions.length > 0
               ? "Use Perplexity to search the news_queries for recent player transactions to understand roster moves"
               : undefined
-          }, null, 2),
-        },
-      ],
-    };
+          });
   }
 
   private async getTrendingPlayers(
@@ -1459,10 +844,7 @@ class SleeperMCPServer {
 
     const lookback = lookbackHours || 24;
     const itemLimit = limit || 25;
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/players/${sport}/trending/${type}?lookback_hours=${lookback}&limit=${itemLimit}`,
-    );
-    const data = await response.json();
+    const data = await this.getJson(`${SLEEPER_API_BASE}/players/${sport}/trending/${type}?lookback_hours=${lookback}&limit=${itemLimit}`);
 
     // Format trending players with names
     const formattedTrending = data.map((item: any) => {
@@ -1479,31 +861,21 @@ class SleeperMCPServer {
       };
     });
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify({
+    return textResult({
             type: type === 'add' ? 'Most Added' : 'Most Dropped',
             lookback_hours: lookbackHours,
             total: formattedTrending.length,
             players: formattedTrending
-          }, null, 2),
-        },
-      ],
-    };
+          });
   }
 
   private async loadPlayersCache() {
-    if (this.playersCache.size === 0) {
+    if (this.playersCache.size === 0 ||
+        Date.now() - this.playersCacheLoadedAt > this.PLAYERS_CACHE_DURATION) {
       try {
-        const response = await fetch(
-          `${SLEEPER_API_BASE}/players/nfl`,
-        );
-        const data = await response.json() as Record<string, SleeperPlayer>;
-        Object.entries(data).forEach(([id, player]) => {
-          this.playersCache.set(id, player);
-        });
+        const data = await this.getJson<Record<string, SleeperPlayer>>(`${SLEEPER_API_BASE}/players/nfl`);
+        this.playersCache = new Map(Object.entries(data));
+        this.playersCacheLoadedAt = Date.now();
       } catch (error) {
         console.error("Failed to load players cache:", error);
       }
@@ -1518,14 +890,7 @@ class SleeperMCPServer {
       return player ? { [id]: player } : { [id]: null };
     });
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(players, null, 2),
-        },
-      ],
-    };
+    return textResult(players);
   }
 
   private async getMyMatchup(week?: number, leagueHint?: string) {
@@ -1534,41 +899,26 @@ class SleeperMCPServer {
     // Find the appropriate user and league
     const config = await this.findUserAndLeague(leagueHint);
     if (!config) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: safeStringify({
+      return textResult({
               error: "No league configuration found",
               message: "Please configure at least one user and league in your .env file",
               hint: "Set SLEEPER_USERNAME_A and SLEEPER_LEAGUE_A_ID_1 in .env"
-            }, null, 2),
-          },
-        ],
-      };
+            });
     }
 
     const { user, league, rosterId } = config;
     if (!rosterId) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: safeStringify({
+      return textResult({
               error: "Could not find roster for user in this league",
               user: user.username,
               league: league.leagueId
-            }, null, 2),
-          },
-        ],
-      };
+            });
     }
 
     // Get current week if not specified
     let actualWeek = week;
     let isHistorical = false;
-    const nflStateResponse = await fetch(`${SLEEPER_API_BASE}/state/nfl`);
-    const nflState = await nflStateResponse.json() as NFLState;
+    const nflState = await this.getJson<NFLState>(`${SLEEPER_API_BASE}/state/nfl`);
     this.currentSeason = nflState.season;
 
     if (!actualWeek) {
@@ -1578,14 +928,8 @@ class SleeperMCPServer {
     }
 
     // Get users for team names
-    const usersResponse = await fetch(
-      `${SLEEPER_API_BASE}/league/${league.leagueId}/users`
-    );
-    const users = await usersResponse.json() as SleeperUser[];
-    const rostersResponse = await fetch(
-      `${SLEEPER_API_BASE}/league/${league.leagueId}/rosters`
-    );
-    const rosters = await rostersResponse.json() as SleeperRoster[];
+    const users = await this.getJson<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/users`);
+    const rosters = await this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/rosters`);
 
     // Create roster ID to team name mapping
     const rosterToTeam = new Map<number, string>();
@@ -1598,10 +942,7 @@ class SleeperMCPServer {
 
     // For past weeks, get actual scores instead of projections
     if (isHistorical) {
-      const matchupsResponse = await fetch(
-        `${SLEEPER_API_BASE}/league/${league.leagueId}/matchups/${actualWeek}`,
-      );
-      const matchups = await matchupsResponse.json() as SleeperMatchup[];
+      const matchups = await this.getJson<SleeperMatchup[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/matchups/${actualWeek}`);
 
       const myMatchup = matchups.find((m) => m.roster_id === parseInt(rosterId));
       const oppMatchup = matchups.find(
@@ -1622,26 +963,19 @@ class SleeperMCPServer {
 
       const opponentName = oppMatchup ? rosterToTeam.get(oppMatchup.roster_id) || `Roster ${oppMatchup.roster_id}` : 'BYE';
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: safeStringify({
+      return textResult({
               week: actualWeek,
               type: "historical",
               my_team: user.username,
               opponent: opponentName,
-              my_score: myMatchup?.points || 0,
-              opponent_score: oppMatchup?.points || 0,
+              my_score: myMatchup ? matchupPoints(myMatchup) : 0,
+              opponent_score: oppMatchup ? matchupPoints(oppMatchup) : 0,
               result: myMatchup && oppMatchup ?
-                (myMatchup.points > oppMatchup.points ? "WON" :
-                 myMatchup.points < oppMatchup.points ? "LOST" : "TIED") : "N/A",
+                (matchupPoints(myMatchup) > matchupPoints(oppMatchup) ? "WON" :
+                 matchupPoints(myMatchup) < matchupPoints(oppMatchup) ? "LOST" : "TIED") : "N/A",
               my_starters: formatPlayers(myMatchup?.starters, myMatchup?.starters_points),
               opponent_starters: formatPlayers(oppMatchup?.starters, oppMatchup?.starters_points),
-            }, null, 2),
-          },
-        ],
-      };
+            });
     }
 
     // For current/future weeks, show projections
@@ -1656,45 +990,28 @@ class SleeperMCPServer {
     // Find the appropriate user and league
     const config = await this.findUserAndLeague(leagueHint);
     if (!config) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: safeStringify({
+      return textResult({
               error: "No league configuration found",
               message: "Please configure at least one user and league in your .env file",
               hint: "Set SLEEPER_USERNAME_A and SLEEPER_LEAGUE_A_ID_1 in .env"
-            }, null, 2),
-          },
-        ],
-      };
+            });
     }
 
     const { user, league, rosterId } = config;
     if (!rosterId) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: safeStringify({
+      return textResult({
               error: "Could not find roster for user in this league",
               user: user.username,
               league: league.leagueId
-            }, null, 2),
-          },
-        ],
-      };
+            });
     }
 
     await this.rateLimit();
-    const [nflStateResponse, usersResponse, rostersResponse] = await Promise.all([
-      fetch(`${SLEEPER_API_BASE}/state/nfl`),
-      fetch(`${SLEEPER_API_BASE}/league/${league.leagueId}/users`),
-      fetch(`${SLEEPER_API_BASE}/league/${league.leagueId}/rosters`),
+    const [nflState, users, rosters] = await Promise.all([
+      this.getJson<NFLState>(`${SLEEPER_API_BASE}/state/nfl`),
+      this.getJson<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/users`),
+      this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/rosters`),
     ]);
-    const nflState = await nflStateResponse.json() as NFLState;
-    const users = await usersResponse.json() as SleeperUser[];
-    const rosters = await rostersResponse.json() as SleeperRoster[];
     const currentWeek = nflState.week;
 
     // Create roster ID to team name mapping
@@ -1708,11 +1025,7 @@ class SleeperMCPServer {
 
     const history = [];
     for (let week = 1; week < currentWeek; week++) {
-      await this.rateLimit();
-      const matchupsResponse = await fetch(
-        `${SLEEPER_API_BASE}/league/${league.leagueId}/matchups/${week}`,
-      );
-      const matchups = await matchupsResponse.json() as SleeperMatchup[];
+      const matchups = await this.getJson<SleeperMatchup[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/matchups/${week}`);
 
       const myMatchup = matchups.find((m) => m.roster_id === parseInt(rosterId));
       const oppMatchup = matchups.find(
@@ -1724,11 +1037,11 @@ class SleeperMCPServer {
         history.push({
           week,
           opponent: opponentName,
-          my_score: myMatchup.points,
-          opponent_score: oppMatchup.points,
-          result: myMatchup.points > oppMatchup.points ? "W" :
-                  myMatchup.points < oppMatchup.points ? "L" : "T",
-          margin: Math.abs(myMatchup.points - oppMatchup.points),
+          my_score: matchupPoints(myMatchup),
+          opponent_score: matchupPoints(oppMatchup),
+          result: matchupPoints(myMatchup) > matchupPoints(oppMatchup) ? "W" :
+                  matchupPoints(myMatchup) < matchupPoints(oppMatchup) ? "L" : "T",
+          margin: Math.abs(matchupPoints(myMatchup) - matchupPoints(oppMatchup)),
         });
       }
     }
@@ -1737,79 +1050,46 @@ class SleeperMCPServer {
     const losses = history.filter(h => h.result === "L").length;
     const ties = history.filter(h => h.result === "T").length;
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify({
+    return textResult({
             season_record: `${wins}-${losses}${ties > 0 ? `-${ties}` : ""}`,
             total_points_for: history.reduce((sum, h) => sum + h.my_score, 0),
             total_points_against: history.reduce((sum, h) => sum + h.opponent_score, 0),
-            avg_points_for: (history.reduce((sum, h) => sum + h.my_score, 0) / history.length),
-            avg_points_against: (history.reduce((sum, h) => sum + h.opponent_score, 0) / history.length),
+            avg_points_for: history.length ? history.reduce((sum, h) => sum + h.my_score, 0) / history.length : 0,
+            avg_points_against: history.length ? history.reduce((sum, h) => sum + h.opponent_score, 0) / history.length : 0,
             matchup_history: history,
-          }, null, 2),
-        },
-      ],
-    };
+          });
   }
 
   private async getMyOpponent(week?: number, leagueHint?: string) {
     // Find the appropriate user and league
     const config = await this.findUserAndLeague(leagueHint);
     if (!config) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: safeStringify({
+      return textResult({
               error: "No league configuration found",
               message: "Please configure at least one user and league in your .env file",
               hint: "Set SLEEPER_USERNAME_A and SLEEPER_LEAGUE_A_ID_1 in .env"
-            }, null, 2),
-          },
-        ],
-      };
+            });
     }
 
     const { user, league, rosterId } = config;
     if (!rosterId) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: safeStringify({
+      return textResult({
               error: "Could not find roster for user in this league",
               user: user.username,
               league: league.leagueId
-            }, null, 2),
-          },
-        ],
-      };
+            });
     }
 
     let actualWeek = week;
     if (!actualWeek) {
-      await this.rateLimit();
-      const nflStateResponse = await fetch(`${SLEEPER_API_BASE}/state/nfl`);
-      const nflState = await nflStateResponse.json() as NFLState;
+      const nflState = await this.getJson<NFLState>(`${SLEEPER_API_BASE}/state/nfl`);
       actualWeek = nflState.week;
     }
 
     // Use sequential requests with rate limiting instead of Promise.all
-    await this.rateLimit();
-    const matchupsResponse = await fetch(
-      `${SLEEPER_API_BASE}/league/${league.leagueId}/matchups/${actualWeek}`,
-    );
-    const matchups = await matchupsResponse.json() as SleeperMatchup[];
-    await this.rateLimit();
-    const rostersResponse = await fetch(
-      `${SLEEPER_API_BASE}/league/${league.leagueId}/rosters`,
-    );
-    const rosters = await rostersResponse.json() as SleeperRoster[];
-    await this.rateLimit();
-    const usersResponse = await fetch(`${SLEEPER_API_BASE}/league/${league.leagueId}/users`);
-    const users = await usersResponse.json() as SleeperUser[];
+    const matchups = await this.getJson<SleeperMatchup[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/matchups/${actualWeek}`);
+    const rosters = await this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/rosters`);
+    const users = await this.getJson<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${league.leagueId}/users`);
 
     const myMatchup = matchups.find((m) => m.roster_id === parseInt(rosterId));
     const oppMatchup = matchups.find(
@@ -1817,24 +1097,13 @@ class SleeperMCPServer {
     );
 
     if (!oppMatchup) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: safeStringify({ message: "No opponent this week (bye week or playoffs)" }, null, 2),
-          },
-        ],
-      };
+      return textResult({ message: "No opponent this week (bye week or playoffs)" });
     }
 
     const oppRoster = rosters.find((r) => r.roster_id === oppMatchup.roster_id);
     const oppUser = users.find((u) => u.user_id === oppRoster?.owner_id);
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify({
+    return textResult({
             week: actualWeek,
             opponent: {
               username: oppUser?.username,
@@ -1845,77 +1114,44 @@ class SleeperMCPServer {
               avatar_thumbnail: oppUser?.avatar ? `${SLEEPER_AVATAR_THUMB_BASE}/${oppUser.avatar}` : null,
               roster_id: oppMatchup.roster_id,
               record: `${oppRoster?.settings.wins}-${oppRoster?.settings.losses}`,
-              points_this_week: oppMatchup.points,
+              points_this_week: matchupPoints(oppMatchup),
               projected_points: "Use preview_matchup for projections",
             },
-          }, null, 2),
-        },
-      ],
-    };
+          });
   }
 
   private async getAvatarUrl(username?: string, userId?: string, thumbnail: boolean = false) {
     let avatarId: string | null = null;
 
     if (userId) {
-      await this.rateLimit();
-      const userResponse = await fetch(
-        `${SLEEPER_API_BASE}/user/${userId}`,
-      );
-      const userData = await userResponse.json() as SleeperUser;
+      const userData = await this.getJson<SleeperUser>(`${SLEEPER_API_BASE}/user/${userId}`);
       avatarId = userData.avatar;
     } else if (username) {
-      await this.rateLimit();
-      const userResponse = await fetch(
-        `${SLEEPER_API_BASE}/user/${username}`,
-      );
-      const userData = await userResponse.json() as SleeperUser;
+      const userData = await this.getJson<SleeperUser>(`${SLEEPER_API_BASE}/user/${username}`);
       avatarId = userData.avatar;
     } else if (this.users.length > 0) {
       // Default to first configured user if no username provided
       const firstUser = this.users[0];
       if (!firstUser.userId) {
-        await this.rateLimit();
-        const userResponse = await fetch(
-          `${SLEEPER_API_BASE}/user/${firstUser.username}`,
-        );
-        const userData = await userResponse.json() as SleeperUser;
+        const userData = await this.getJson<SleeperUser>(`${SLEEPER_API_BASE}/user/${firstUser.username}`);
         firstUser.userId = userData.user_id;
         avatarId = userData.avatar;
       } else {
-        await this.rateLimit();
-        const userResponse = await fetch(
-          `${SLEEPER_API_BASE}/user/${firstUser.userId}`,
-        );
-        const userData = await userResponse.json() as SleeperUser;
+        const userData = await this.getJson<SleeperUser>(`${SLEEPER_API_BASE}/user/${firstUser.userId}`);
         avatarId = userData.avatar;
       }
     }
 
     if (!avatarId) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: safeStringify({ error: "No avatar found for user" }, null, 2),
-          },
-        ],
-      };
+      return textResult({ error: "No avatar found for user" });
     }
 
     const baseUrl = thumbnail ? SLEEPER_AVATAR_THUMB_BASE : SLEEPER_AVATAR_BASE;
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify({
+    return textResult({
             avatar_id: avatarId,
             avatar_url: `${baseUrl}/${avatarId}`,
             thumbnail: thumbnail,
-          }, null, 2),
-        },
-      ],
-    };
+          });
   }
 
   private async getMyInfo() {
@@ -1936,10 +1172,7 @@ class SleeperMCPServer {
       // Fetch user details if not cached
       if (!user.userId) {
         try {
-          const userResponse = await fetch(
-            `${SLEEPER_API_BASE}/user/${user.username}`,
-          );
-          const userData = await userResponse.json() as SleeperUser;
+          const userData = await this.getJson<SleeperUser>(`${SLEEPER_API_BASE}/user/${user.username}`);
           user.userId = userData.user_id;
           userConfig.user_id = user.userId;
           userConfig.avatar = userData.avatar;
@@ -1957,10 +1190,7 @@ class SleeperMCPServer {
 
         try {
           if (!league.leagueName) {
-            const leagueResponse = await fetch(
-              `${SLEEPER_API_BASE}/league/${league.leagueId}`,
-            );
-            const leagueData = await leagueResponse.json() as SleeperLeague;
+            const leagueData = await this.getJson<SleeperLeague>(`${SLEEPER_API_BASE}/league/${league.leagueId}`);
             league.leagueName = leagueData.name;
           }
           leagueInfo.name = league.leagueName;
@@ -1980,14 +1210,7 @@ class SleeperMCPServer {
       info.configurations.push(userConfig);
     }
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(info, null, 2),
-        },
-      ],
-    };
+    return textResult(info);
   }
 
   private async analyzeTrade(
@@ -1999,15 +1222,11 @@ class SleeperMCPServer {
   ) {
     await this.loadPlayersCache();
 
-    const [leagueResponse, rostersResponse, usersResponse] = await Promise.all([
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}`),
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
+    const [league, rosters, users] = await Promise.all([
+      this.getJson<SleeperLeague>(`${SLEEPER_API_BASE}/league/${leagueId}`),
+      this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
+      this.getJson<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
     ]);
-
-    const league = await leagueResponse.json() as SleeperLeague;
-    const rosters = await rostersResponse.json() as SleeperRoster[];
-    const users = await usersResponse.json() as SleeperUser[];
 
     const roster1 = rosters.find((r) => r.roster_id === rosterId1);
     const roster2 = rosters.find((r) => r.roster_id === rosterId2);
@@ -2110,14 +1329,7 @@ class SleeperMCPServer {
       team2_record: `${roster2.settings.wins}-${roster2.settings.losses}`,
     };
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(analysis, null, 2),
-        },
-      ],
-    };
+    return textResult(analysis);
   }
 
   private analyzePositionalNeeds(
@@ -2162,17 +1374,12 @@ class SleeperMCPServer {
   ) {
     await this.loadPlayersCache();
 
-    const [rostersResponse, trendingResponse, nflStateResponse, leagueInfoResponse] = await Promise.all([
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
-      fetch(`${SLEEPER_API_BASE}/players/nfl/trending/add?lookback_hours=24&limit=50`),
-      fetch(`${SLEEPER_API_BASE}/state/nfl`),
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}`),
+    const [rosters, trending, nflState, leagueInfo] = await Promise.all([
+      this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
+      this.getJson(`${SLEEPER_API_BASE}/players/nfl/trending/add?lookback_hours=24&limit=50`),
+      this.getJson<NFLState>(`${SLEEPER_API_BASE}/state/nfl`),
+      this.getJson<SleeperLeague>(`${SLEEPER_API_BASE}/league/${leagueId}`),
     ]);
-
-    const rosters = await rostersResponse.json() as SleeperRoster[];
-    const trending = await trendingResponse.json();
-    const nflState = await nflStateResponse.json() as NFLState;
-    const leagueInfo = await leagueInfoResponse.json() as SleeperLeague;
 
     const roster = rosters.find((r) => r.roster_id === rosterId);
     if (!roster) throw new Error("Roster not found");
@@ -2249,29 +1456,12 @@ class SleeperMCPServer {
     availablePlayers.sort((a, b) => b.initial_score - a.initial_score);
     const topCandidates = availablePlayers.slice(0, Math.min(50, limit ? limit * 3 : 30));
 
-    // Second pass: get projections only for top candidates
+    // Second pass: score top candidates with one bulk projections call
+    const projections = await this.getWeekProjections(season, currentWeek, leagueInfo.scoring_settings);
     for (const player of topCandidates) {
-      let avgProjection = 0;
-
-      // Only fetch projections for trending players or those filling needs
-      if (player.is_trending || player.need_score > 0) {
-        try {
-          await this.rateLimit();
-          // Get just current week projection as indicator
-          const projResponse = await fetch(
-            `${SLEEPER_PROJECTIONS_BASE}/player/${player.player_id}?season_type=regular&season=${season}&week=${currentWeek}`,
-          );
-          const projData = await projResponse.json();
-          if (projData?.stats?.pts_ppr) {
-            avgProjection = projData.stats.pts_ppr;
-          }
-        } catch (e) {
-          // Use 0 if no projection available
-        }
-      }
-
-      player.avg_projection = avgProjection;
-      player.overall_score = (avgProjection * 2) + player.initial_score;
+      const projection = projections.get(player.player_id) || 0;
+      player.avg_projection = projection;
+      player.overall_score = (projection * 2) + player.initial_score;
     }
 
     // Sort by overall score (combination of projections, trending, and need)
@@ -2296,7 +1486,7 @@ class SleeperMCPServer {
           news_queries: trendingAdds > 100 ? {
             primary: `${playerName} NFL ${new Date().getFullYear()} injury trade waiver wire news`,
             alternate: [
-              `${playerName} fantasy football outlook week ${this.currentWeek}`,
+              `${playerName} fantasy football outlook week ${currentWeek}`,
               `${playerName} ${player.team || 'NFL'} depth chart injury report`,
               `Why is ${playerName} trending fantasy football waiver wire adds`
             ],
@@ -2325,14 +1515,7 @@ class SleeperMCPServer {
         : undefined
     };
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(result, null, 2),
-        },
-      ],
-    };
+    return textResult(result);
   }
 
   private async previewMatchup(
@@ -2355,25 +1538,18 @@ class SleeperMCPServer {
         matchups = cachedMatchups;
         rosters = cachedRosters;
         // Still fetch users and league info as they don't change often
-        const [usersResponse, leagueInfoResponse] = await Promise.all([
-          fetch(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
-          fetch(`${SLEEPER_API_BASE}/league/${leagueId}`),
+        [users, leagueInfo] = await Promise.all([
+          this.getJson<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
+          this.getJson<SleeperLeague>(`${SLEEPER_API_BASE}/league/${leagueId}`),
         ]);
-        users = await usersResponse.json() as SleeperUser[];
-        leagueInfo = await leagueInfoResponse.json() as SleeperLeague;
       } else {
         // Fetch and cache
-        const [matchupsResponse, rostersResponse, usersResponse, leagueInfoResponse] = await Promise.all([
-          fetch(`${SLEEPER_API_BASE}/league/${leagueId}/matchups/${week}`),
-          fetch(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
-          fetch(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
-          fetch(`${SLEEPER_API_BASE}/league/${leagueId}`),
+        [matchups, rosters, users, leagueInfo] = await Promise.all([
+          this.getJson<SleeperMatchup[]>(`${SLEEPER_API_BASE}/league/${leagueId}/matchups/${week}`),
+          this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
+          this.getJson<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
+          this.getJson<SleeperLeague>(`${SLEEPER_API_BASE}/league/${leagueId}`),
         ]);
-
-        matchups = await matchupsResponse.json() as SleeperMatchup[];
-        rosters = await rostersResponse.json() as SleeperRoster[];
-        users = await usersResponse.json() as SleeperUser[];
-        leagueInfo = await leagueInfoResponse.json() as SleeperLeague;
 
         // Cache for current week
         this.currentWeekCache.matchups.set(leagueId, matchups);
@@ -2382,17 +1558,12 @@ class SleeperMCPServer {
       }
     } else {
       // Don't cache data for other weeks
-      const [matchupsResponse, rostersResponse, usersResponse, leagueInfoResponse] = await Promise.all([
-        fetch(`${SLEEPER_API_BASE}/league/${leagueId}/matchups/${week}`),
-        fetch(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
-        fetch(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
-        fetch(`${SLEEPER_API_BASE}/league/${leagueId}`),
+      [matchups, rosters, users, leagueInfo] = await Promise.all([
+        this.getJson<SleeperMatchup[]>(`${SLEEPER_API_BASE}/league/${leagueId}/matchups/${week}`),
+        this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
+        this.getJson<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
+        this.getJson<SleeperLeague>(`${SLEEPER_API_BASE}/league/${leagueId}`),
       ]);
-
-      matchups = await matchupsResponse.json() as SleeperMatchup[];
-      rosters = await rostersResponse.json() as SleeperRoster[];
-      users = await usersResponse.json() as SleeperUser[];
-      leagueInfo = await leagueInfoResponse.json() as SleeperLeague;
     }
 
     const myMatchup = matchups.find((m: SleeperMatchup) => m.roster_id === rosterId);
@@ -2412,109 +1583,12 @@ class SleeperMCPServer {
       ? users.find((u) => u.user_id === opponentRoster.owner_id)
       : null;
 
-    // Get season stats for better projections
-    const season = leagueInfo.season;
-    const currentWeek = week;
-
-    // Fetch bulk projections like Sleeper does
-    const fetchBulkProjections = async () => {
-      const cacheKey = `${season}-${currentWeek}-${leagueId}`;
-
-      // Check cache first
-      if (isCurrentWeek && this.currentWeekCache.bulkProjections.has(cacheKey)) {
-        return this.currentWeekCache.bulkProjections.get(cacheKey)!;
-      }
-
-      try {
-        await this.rateLimit();
-
-        // Fetch bulk projections using the same endpoint pattern as Sleeper
-        // Include all flex-eligible positions
-        const positions = ['QB', 'RB', 'WR', 'TE', 'FLEX'];
-        const positionParams = positions.map(p => `position[]=${p}`).join('&');
-
-        // Determine scoring type from league settings
-        const scoringSettings = leagueInfo.scoring_settings;
-        let orderBy = 'ppr'; // Default to PPR like Sleeper
-        if (scoringSettings.rec === 0.5) {
-          orderBy = 'half_ppr';
-        } else if (scoringSettings.rec === 0) {
-          orderBy = 'std';
-        }
-
-        const projResponse = await fetch(
-          `${SLEEPER_PROJECTIONS_BASE}/${season}/${currentWeek}?season_type=regular&${positionParams}&order_by=${orderBy}`,
-        );
-        const projData = await projResponse.json();
-
-        if (projData) {
-          // Cache for current week only
-          if (isCurrentWeek) {
-            this.currentWeekCache.bulkProjections.set(cacheKey, projData);
-            this.currentWeekCache.timestamp = Date.now();
-          }
-          return projData;
-        }
-      } catch (e) {
-        // Projections not available
-      }
-
-      return [];
-    };
-
-    // Get all projections in bulk
-    const allProjections = await fetchBulkProjections();
-    const projectionMap = new Map();
-
-    // Build projection map
-    for (const proj of allProjections) {
-      if (proj.player_id && proj.stats) {
-        const stats = proj.stats;
-        const scoringSettings = leagueInfo.data.scoring_settings;
-
-        // Calculate fantasy points based on league's specific scoring settings
-        let points = 0;
-
-        // Common scoring categories - calculate from raw stats
-        if (stats.pass_yd && scoringSettings.pass_yd) points += (stats.pass_yd * scoringSettings.pass_yd);
-        if (stats.pass_td && scoringSettings.pass_td) points += (stats.pass_td * scoringSettings.pass_td);
-        if (stats.pass_int && scoringSettings.pass_int) points += (stats.pass_int * scoringSettings.pass_int);
-        if (stats.pass_2pt && scoringSettings.pass_2pt) points += (stats.pass_2pt * scoringSettings.pass_2pt);
-
-        if (stats.rush_yd && scoringSettings.rush_yd) points += (stats.rush_yd * scoringSettings.rush_yd);
-        if (stats.rush_td && scoringSettings.rush_td) points += (stats.rush_td * scoringSettings.rush_td);
-        if (stats.rush_2pt && scoringSettings.rush_2pt) points += (stats.rush_2pt * scoringSettings.rush_2pt);
-
-        if (stats.rec && scoringSettings.rec) points += (stats.rec * scoringSettings.rec);
-        if (stats.rec_yd && scoringSettings.rec_yd) points += (stats.rec_yd * scoringSettings.rec_yd);
-        if (stats.rec_td && scoringSettings.rec_td) points += (stats.rec_td * scoringSettings.rec_td);
-        if (stats.rec_2pt && scoringSettings.rec_2pt) points += (stats.rec_2pt * scoringSettings.rec_2pt);
-
-        if (stats.fum_lost && scoringSettings.fum_lost) points += (stats.fum_lost * scoringSettings.fum_lost);
-        if (stats.fum && scoringSettings.fum) points += (stats.fum * scoringSettings.fum);
-        if (stats.fum_rec && scoringSettings.fum_rec) points += (stats.fum_rec * scoringSettings.fum_rec);
-        if (stats.fum_rec_td && scoringSettings.fum_rec_td) points += (stats.fum_rec_td * scoringSettings.fum_rec_td);
-
-        // If no custom calculation, use pre-calculated values
-        if (points === 0) {
-          // Check for PPR, Half-PPR, or Standard scoring
-          if (scoringSettings.rec === 1) {
-            points = stats.pts_ppr || 0;
-          } else if (scoringSettings.rec === 0.5) {
-            points = stats.pts_half_ppr || 0;
-          } else {
-            points = stats.pts_std || 0;
-          }
-        }
-
-        projectionMap.set(proj.player_id, points);
-
-        // Also cache individual projections for current week
-        if (isCurrentWeek) {
-          this.currentWeekCache.projections.set(proj.player_id, points);
-        }
-      }
-    }
+    const projectionMap = await this.getWeekProjections(
+      leagueInfo.season,
+      week,
+      leagueInfo.scoring_settings,
+      isCurrentWeek ? `${leagueId}` : undefined,
+    );
 
     // Helper to get projection for a player
     const getPlayerProjection = (playerId: string) => {
@@ -2563,7 +1637,7 @@ class SleeperMCPServer {
         name: myUser?.display_name || myUser?.username,
         roster_id: rosterId,
         record: `${myRoster?.settings.wins}-${myRoster?.settings.losses}`,
-        projected_points: myProjected,
+        projected_points: Math.round(myProjected * 100) / 100,
         starters: myStarters,
       },
       opponent: opponentUser
@@ -2571,37 +1645,66 @@ class SleeperMCPServer {
             name: opponentUser.display_name || opponentUser.username,
             roster_id: opponentRoster?.roster_id,
             record: `${opponentRoster?.settings.wins}-${opponentRoster?.settings.losses}`,
-            projected_points: oppProjected,
+            projected_points: Math.round(oppProjected * 100) / 100,
             starters: opponentStarters,
           }
         : null,
-      win_probability:
-        ((myProjected / (myProjected + oppProjected)) * 100).toFixed(1) + "%",
+      win_probability: myProjected + oppProjected > 0
+        ? ((myProjected / (myProjected + oppProjected)) * 100).toFixed(1) + "%"
+        : "N/A (no projections available)",
       injury_concerns: injuryConcerns,
       recommendation:
         myProjected > oppProjected ? "Favored to win" : "Underdog",
     };
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(preview, null, 2),
-        },
-      ],
-    };
+    return textResult(preview);
+  }
+
+  // Fetch bulk weekly projections and score them with the league's scoring settings.
+  // Returns playerId -> projected fantasy points.
+  private async getWeekProjections(
+    season: string,
+    week: number,
+    scoringSettings: Record<string, number> = {},
+    cacheScope?: string,
+  ): Promise<Map<string, number>> {
+    const cacheKey = cacheScope ? `${season}-${week}-${cacheScope}` : undefined;
+    let projData: any[] | undefined = cacheKey && this.isCacheValid()
+      ? this.currentWeekCache.bulkProjections.get(cacheKey)
+      : undefined;
+
+    if (!projData) {
+      try {
+        const positionParams = PROJECTION_POSITIONS.map(p => `position[]=${p}`).join('&');
+        projData = await this.getJson<any[]>(
+          `${SLEEPER_PROJECTIONS_BASE}/${season}/${week}?season_type=regular&${positionParams}&order_by=${scoringOrderBy(scoringSettings)}`,
+        );
+        if (cacheKey && Array.isArray(projData)) {
+          this.currentWeekCache.bulkProjections.set(cacheKey, projData);
+          this.currentWeekCache.timestamp = Date.now();
+        }
+      } catch (e) {
+        console.error('Error fetching projections:', e);
+        projData = [];
+      }
+    }
+
+    const projectionMap = new Map<string, number>();
+    for (const proj of Array.isArray(projData) ? projData : []) {
+      if (proj?.player_id && proj.stats) {
+        projectionMap.set(proj.player_id, scoreStats(proj.stats, scoringSettings));
+      }
+    }
+    return projectionMap;
   }
 
   private async getFreeAgents(leagueId: string, position?: string) {
     await this.loadPlayersCache();
 
-    const [rostersResp, trendingResp] = await Promise.all([
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
-      fetch(`${SLEEPER_API_BASE}/players/nfl/trending/add`).catch(() => null)
+    const [rosters, trending] = await Promise.all([
+      this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
+      this.getJson(`${SLEEPER_API_BASE}/players/nfl/trending/add`).catch(() => null),
     ]);
-
-    const rosters = await rostersResp.json() as SleeperRoster[];
-    const trending = trendingResp ? await trendingResp.json() : null;
 
     const allRosteredPlayers = new Set(
       rosters.flatMap((r) => r.players || []),
@@ -2654,12 +1757,7 @@ class SleeperMCPServer {
     const topFreeAgents = freeAgents.slice(0, 100);
     const highTrendingPlayers = topFreeAgents.filter(p => p.trending_adds > 100);
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(
-            {
+    return textResult({
               total: freeAgents.length,
               position_filter: position || "all",
               free_agents: topFreeAgents,
@@ -2667,13 +1765,7 @@ class SleeperMCPServer {
               news_instruction: highTrendingPlayers.length > 0
                 ? `Use Perplexity to search news for trending players: ${highTrendingPlayers.slice(0, 5).map(p => p.name).join(', ')}`
                 : undefined
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+            });
   }
 
   private async analyzeLineup(
@@ -2683,13 +1775,10 @@ class SleeperMCPServer {
   ) {
     await this.loadPlayersCache();
 
-    const [leagueResponse, rostersResponse] = await Promise.all([
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}`),
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
+    const [league, rosters] = await Promise.all([
+      this.getJson<SleeperLeague>(`${SLEEPER_API_BASE}/league/${leagueId}`),
+      this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
     ]);
-
-    const league = await leagueResponse.json() as SleeperLeague;
-    const rosters = await rostersResponse.json() as SleeperRoster[];
 
     const roster = rosters.find((r) => r.roster_id === rosterId);
     if (!roster) throw new Error("Roster not found");
@@ -2698,20 +1787,13 @@ class SleeperMCPServer {
     const starters = roster.starters || [];
     const bench = roster.players.filter((p) => !starters.includes(p));
 
+    const projections = await this.getWeekProjections(league.season, week, league.scoring_settings);
+
     const getPlayerScore = (playerId: string): number => {
       const player = this.playersCache.get(playerId);
       if (!player) return 0;
-
-      let score = 8;
-      if (player.position === "QB") score = 18;
-      if (player.position === "RB") score = 13;
-      if (player.position === "WR") score = 11;
-      if (player.position === "TE") score = 9;
-      if (player.position === "K") score = 8;
-      if (player.position === "DEF") score = 8;
-      if (player.injury_status) score *= 0.5;
-
-      return score;
+      if (player.injury_status && ["Out", "IR", "PUP", "Sus", "NA"].includes(player.injury_status)) return 0;
+      return projections.get(playerId) || 0;
     };
 
     const lineupAnalysis = starters.map((playerId, idx) => {
@@ -2753,24 +1835,13 @@ class SleeperMCPServer {
           `Consider starting ${p.better_options[0]} over ${p.current} at ${p.slot}`,
       );
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(
-            {
+    return textResult({
               week,
               roster_id: rosterId,
               total_projected: totalProjected,
               lineup: lineupAnalysis,
               optimization_suggestions: suggestions,
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+            });
   }
 
   private async getPlayerProjections(
@@ -2778,142 +1849,83 @@ class SleeperMCPServer {
     week: number,
     position?: string,
   ) {
-    const projectionsResponse = await fetch(
-      `${SLEEPER_API_BASE}/projections/nfl/${season}/${week}?season_type=regular&position=${position || ""}`,
-    );
-    const projections = await projectionsResponse.json();
+    await this.loadPlayersCache();
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(projections, null, 2),
-        },
-      ],
-    };
+    const positions = position ? [position.toUpperCase()] : PROJECTION_POSITIONS;
+    const positionParams = positions.map(p => `position[]=${p}`).join('&');
+    const projections = await this.getJson<any[]>(
+      `${SLEEPER_PROJECTIONS_BASE}/${season}/${week}?season_type=regular&${positionParams}&order_by=ppr`,
+    );
+
+    const rows = (Array.isArray(projections) ? projections : [])
+      .filter((p) => p?.player_id && p.stats)
+      .map((p) => {
+        const player = this.playersCache.get(p.player_id);
+        return {
+          player_id: p.player_id,
+          name: player ? `${player.first_name} ${player.last_name}` : p.player?.first_name ? `${p.player.first_name} ${p.player.last_name}` : undefined,
+          position: player?.position ?? p.player?.position,
+          team: p.team ?? player?.team,
+          opponent: p.opponent,
+          pts_ppr: p.stats.pts_ppr ?? 0,
+          pts_half_ppr: p.stats.pts_half_ppr ?? 0,
+          pts_std: p.stats.pts_std ?? 0,
+          stats: p.stats,
+        };
+      })
+      .sort((a, b) => b.pts_ppr - a.pts_ppr);
+
+    return textResult({
+      season,
+      week,
+      position_filter: position || "all",
+      total: rows.length,
+      projections: rows.slice(0, 150),
+    });
   }
+
 
   // Draft methods
   private async getUserDrafts(userId: string, sport: string, season: string) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/user/${userId}/drafts/${sport}/${season}`,
-    );
-    const data = await response.json() as SleeperDraft[];
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperDraft[]>(`${SLEEPER_API_BASE}/user/${userId}/drafts/${sport}/${season}`);
+    return textResult(data);
   }
 
   private async getLeagueDrafts(leagueId: string) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/league/${leagueId}/drafts`,
-    );
-    const data = await response.json() as SleeperDraft[];
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperDraft[]>(`${SLEEPER_API_BASE}/league/${leagueId}/drafts`);
+    return textResult(data);
   }
 
   private async getDraftInfo(draftId: string) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/draft/${draftId}`,
-    );
-    const data = await response.json() as SleeperDraft;
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperDraft>(`${SLEEPER_API_BASE}/draft/${draftId}`);
+    return textResult(data);
   }
 
   private async getDraftPicks(draftId: string) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/draft/${draftId}/picks`,
-    );
-    const data = await response.json() as SleeperDraftPick[];
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperDraftPick[]>(`${SLEEPER_API_BASE}/draft/${draftId}/picks`);
+    return textResult(data);
   }
 
   private async getDraftTradedPicks(draftId: string) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/draft/${draftId}/traded_picks`,
-    );
-    const data = await response.json() as SleeperTradedPick[];
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperTradedPick[]>(`${SLEEPER_API_BASE}/draft/${draftId}/traded_picks`);
+    return textResult(data);
   }
 
   // Bracket methods
   private async getWinnersBracket(leagueId: string) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/league/${leagueId}/winners_bracket`,
-    );
-    const data = await response.json() as SleeperBracketMatchup[];
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperBracketMatchup[]>(`${SLEEPER_API_BASE}/league/${leagueId}/winners_bracket`);
+    return textResult(data);
   }
 
   private async getLosersBracket(leagueId: string) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/league/${leagueId}/losers_bracket`,
-    );
-    const data = await response.json() as SleeperBracketMatchup[];
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperBracketMatchup[]>(`${SLEEPER_API_BASE}/league/${leagueId}/losers_bracket`);
+    return textResult(data);
   }
 
   // Traded picks
   private async getLeagueTradedPicks(leagueId: string) {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/league/${leagueId}/traded_picks`,
-    );
-    const data = await response.json() as SleeperTradedPick[];
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    const data = await this.getJson<SleeperTradedPick[]>(`${SLEEPER_API_BASE}/league/${leagueId}/traded_picks`);
+    return textResult(data);
   }
 
   // Helper to get current season from NFL state
@@ -2922,20 +1934,14 @@ class SleeperMCPServer {
       return this.currentSeason;
     }
 
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/state/nfl`,
-    );
-    const data = await response.json() as NFLState;
+    const data = await this.getJson<NFLState>(`${SLEEPER_API_BASE}/state/nfl`);
     this.currentSeason = data.season;
     return this.currentSeason;
   }
 
   // NFL State
   private async getNFLState() {
-    const response = await fetch(
-      `${SLEEPER_API_BASE}/state/nfl`,
-    );
-    const data = await response.json() as NFLState;
+    const data = await this.getJson<NFLState>(`${SLEEPER_API_BASE}/state/nfl`);
     // Cache the season and week
     this.currentSeason = data.season;
     this.currentWeek = data.week;
@@ -2943,31 +1949,19 @@ class SleeperMCPServer {
     // Clear old cache if week changed
     this.clearOldCache();
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    return textResult(data);
   }
 
   // Advanced analytics
   private async getMatchupScores(leagueId: string, week: number) {
     await this.loadPlayersCache();
 
-    const [matchupsResponse, rostersResponse, usersResponse, nflStateResponse] = await Promise.all([
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/matchups/${week}`),
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
-      fetch(`${SLEEPER_API_BASE}/state/nfl`),
+    const [matchups, rosters, users, nflState] = await Promise.all([
+      this.getJson<SleeperMatchup[]>(`${SLEEPER_API_BASE}/league/${leagueId}/matchups/${week}`),
+      this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
+      this.getJson<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
+      this.getJson<NFLState>(`${SLEEPER_API_BASE}/state/nfl`),
     ]);
-
-    const matchups = await matchupsResponse.json() as SleeperMatchup[];
-    const rosters = await rostersResponse.json() as SleeperRoster[];
-    const users = await usersResponse.json() as SleeperUser[];
-    const nflState = await nflStateResponse.json() as NFLState;
 
     // Create user mapping
     const rosterToUser: Record<number, string> = {};
@@ -2994,7 +1988,7 @@ class SleeperMCPServer {
         team1: {
           name: rosterToUser[team1.roster_id],
           roster_id: team1.roster_id,
-          points: team1.points,
+          points: matchupPoints(team1),
           starters: team1.starters.map((pid) => {
             const player = this.playersCache.get(pid);
             return player ? `${player.first_name} ${player.last_name}` : pid;
@@ -3003,7 +1997,7 @@ class SleeperMCPServer {
         team2: team2 ? {
           name: rosterToUser[team2.roster_id],
           roster_id: team2.roster_id,
-          points: team2.points,
+          points: matchupPoints(team2),
           starters: team2.starters.map((pid) => {
             const player = this.playersCache.get(pid);
             return player ? `${player.first_name} ${player.last_name}` : pid;
@@ -3013,36 +2007,20 @@ class SleeperMCPServer {
       };
     });
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(
-            {
+    return textResult({
               week,
               current_nfl_week: nflState.week,
               matchups: formattedMatchups,
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+            });
   }
 
   private async analyzeTradeTargets(leagueId: string, rosterId: number) {
     await this.loadPlayersCache();
 
-    const [rostersResponse, matchupsResponse, usersResponse] = await Promise.all([
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/matchups/1`),
-      fetch(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
+    const [rosters, users] = await Promise.all([
+      this.getJson<SleeperRoster[]>(`${SLEEPER_API_BASE}/league/${leagueId}/rosters`),
+      this.getJson<SleeperUser[]>(`${SLEEPER_API_BASE}/league/${leagueId}/users`),
     ]);
-
-    const rosters = await rostersResponse.json() as SleeperRoster[];
-    const matchups = await matchupsResponse.json() as SleeperMatchup[];
-    const users = await usersResponse.json() as SleeperUser[];
 
     const myRoster = rosters.find((r) => r.roster_id === rosterId);
     if (!myRoster) throw new Error("Roster not found");
@@ -3097,62 +2075,36 @@ class SleeperMCPServer {
       }
     });
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(
-            {
+    return textResult({
               your_team: myTeamName,
               position_needs: needs,
               current_roster: positionCounts,
               trade_targets: targets,
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+            });
   }
 
   private async getPlayerStats(playerId: string, season: string, week?: number) {
-    const endpoint = week
-      ? `${SLEEPER_API_BASE}/stats/nfl/player/${playerId}?season_type=regular&season=${season}&grouping=week`
-      : `${SLEEPER_API_BASE}/stats/nfl/player/${playerId}?season_type=regular&season=${season}`;
+    const grouping = week ? "week" : "season";
+    const data = await this.getJson<any>(
+      `${SLEEPER_STATS_BASE}/player/${playerId}?season_type=regular&season=${season}&grouping=${grouping}`,
+    );
 
-    const response = await fetch(endpoint);
-    const data = await response.json();
-
-    // If week specified, return just that week's stats
-    if (week && data) {
-      const weekStats = data[week.toString()];
-      return {
-        content: [
-          {
-            type: "text",
-            text: safeStringify(weekStats || { message: "No stats for this week" }, null, 2),
-          },
-        ],
-      };
+    // grouping=week returns an object keyed by week number (null on bye weeks)
+    if (week) {
+      const weekStats = data?.[week.toString()];
+      return textResult(weekStats || { message: `No stats for week ${week} (bye week or not yet played)` });
     }
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: safeStringify(data, null, 2),
-        },
-      ],
-    };
+    return textResult(data || { message: `No stats for season ${season}` });
   }
 
-  async run() {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
+
+  run() {
+    serveStdio(() => this.createServer(), {
+      onerror: (error) => console.error("MCP transport error:", error),
+    });
     console.error("Sleeper MCP server running on stdio");
   }
 }
 
-const server = new SleeperMCPServer();
-server.run().catch(console.error);
+new SleeperMCPServer().run();
