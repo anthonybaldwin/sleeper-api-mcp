@@ -1,6 +1,5 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { McpServer, type CallToolResult } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import pkg from "../package.json" with { type: "json" };
 
@@ -226,7 +225,6 @@ interface UserConfig {
 }
 
 class SleeperMCPServer {
-  private server: McpServer;
   private playersCache: Map<string, SleeperPlayer> = new Map();
   private projectionsCache: Map<string, PlayerProjection> = new Map();
   private users: UserConfig[] = [];
@@ -258,14 +256,6 @@ class SleeperMCPServer {
   constructor() {
     // Parse all users and leagues from environment variables
     this.parseEnvironmentConfig();
-
-    this.server = new McpServer({
-      name: "sleeper-api-mcp",
-      title: "Sleeper Fantasy Football",
-      version: pkg.version,
-    });
-
-    this.registerTools();
 
     // Log configuration on startup
     console.error(`Loaded ${this.users.length} user(s) configuration:`);
@@ -491,7 +481,18 @@ class SleeperMCPServer {
     }
   }
 
-  private registerTools() {
+  // Builds an MCP server bound to this instance's shared config and caches
+  createServer(): McpServer {
+    const server = new McpServer({
+      name: "sleeper-api-mcp",
+      title: "Sleeper Fantasy Football",
+      version: pkg.version,
+    });
+    this.registerTools(server);
+    return server;
+  }
+
+  private registerTools(server: McpServer) {
     const tool = <S extends z.ZodRawShape>(
       name: string,
       title: string,
@@ -499,12 +500,12 @@ class SleeperMCPServer {
       inputSchema: S,
       handler: (args: z.infer<z.ZodObject<S>>) => Promise<CallToolResult>,
     ) => {
-      this.server.registerTool(
+      server.registerTool(
         name,
         {
           title,
           description,
-          inputSchema,
+          inputSchema: z.object(inputSchema),
           annotations: { readOnlyHint: true, openWorldHint: true },
         },
         (async (args: z.infer<z.ZodObject<S>>) => {
@@ -2098,12 +2099,12 @@ class SleeperMCPServer {
   }
 
 
-  async run() {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
+  run() {
+    serveStdio(() => this.createServer(), {
+      onerror: (error) => console.error("MCP transport error:", error),
+    });
     console.error("Sleeper MCP server running on stdio");
   }
 }
 
-const server = new SleeperMCPServer();
-server.run().catch(console.error);
+new SleeperMCPServer().run();
