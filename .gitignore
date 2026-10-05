@@ -1,5 +1,7 @@
 node_modules/
 dist/
+sleeper-mcp
+sleeper-mcp.exe
 .env
 *.log
 .DS_Store
